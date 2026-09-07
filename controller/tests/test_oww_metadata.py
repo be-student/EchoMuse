@@ -22,6 +22,39 @@ def test_custom_identity_does_not_change_prediction_key():
     assert em_oww_models.prediction_key(name) == "not_the_phrase"
 
 
+@pytest.mark.parametrize(
+    "class_name", ["EchoMuseSatellite", "DeviceESPhomeServer"]
+)
+def test_esphome_constructors_require_resolved_model_metadata(class_name):
+    source = Path(__file__).resolve().parents[1] / "em_esphome.py"
+    tree = ast.parse(source.read_text())
+    class_def = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+    constructor = next(
+        node
+        for node in class_def.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+    positional = constructor.args.posonlyargs + constructor.args.args
+    required = positional[:len(positional) - len(constructor.args.defaults)]
+    assert "oww_model_info" in {argument.arg for argument in required}
+
+    assignments = [
+        node for node in ast.walk(constructor)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Attribute) and target.attr == "oww_model_info"
+            for target in node.targets
+        )
+    ]
+    assert len(assignments) == 1
+    assert isinstance(assignments[0].value, ast.Name)
+    assert assignments[0].value.id == "oww_model_info"
+
+
 def test_missing_and_unreadable_models_fall_back(tmp_path, monkeypatch):
     path = tmp_path / "hey_robot.onnx"
     assert metadata.resolve(str(path)).name == "hey robot"

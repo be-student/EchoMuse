@@ -329,7 +329,7 @@ class EchoMuseSatellite(SatelliteServerProtocol):
         mac_address: str,
         oww_model_id: str,
         on_disconnected_cb,
-        oww_model_info=None,
+        oww_model_info,
         owning_server=None,   # DeviceESPhomeServer — back-reference so the
                               # standalone-announce path can read the live
                               # _standalone_play callback rather than a
@@ -346,7 +346,7 @@ class EchoMuseSatellite(SatelliteServerProtocol):
         self.label          = label
         self.mac_address    = mac_address
         self.oww_model_id   = oww_model_id
-        self.oww_model_info = oww_model_info or em_oww_metadata.resolve(oww_model_id)
+        self.oww_model_info = oww_model_info
         self._owning_server  = owning_server
         # Strong references to in-flight timer-event tasks (see the
         # VoiceAssistantTimerEventResponse branch).
@@ -2184,12 +2184,20 @@ class DeviceESPhomeServer:
     inbound connection is rejected with DisconnectResponse + close.
     """
 
-    def __init__(self, device_id: str, label: str, mac_address: str, oww_model_id: str, port: int, oww_model_info=None) -> None:
+    def __init__(
+        self,
+        device_id: str,
+        label: str,
+        mac_address: str,
+        oww_model_id: str,
+        port: int,
+        oww_model_info,
+    ) -> None:
         self.device_id    = device_id
         self.label        = label
         self.mac_address  = mac_address
         self.oww_model_id = oww_model_id
-        self.oww_model_info = oww_model_info or em_oww_metadata.resolve(oww_model_id)
+        self.oww_model_info = oww_model_info
         self.port         = port
         self._server: Optional[asyncio.AbstractServer] = None
         self._active_satellite: Optional[EchoMuseSatellite] = None
