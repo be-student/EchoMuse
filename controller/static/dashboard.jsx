@@ -3591,6 +3591,8 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
   // bytes outside the field are never touched. Refuse an image that cannot
   // hold the appended argument rather than truncating an existing argument.
   function patchBootCmdline(bootImg) {
+    // Keep the field bounds and append-only rules aligned with em_emos_build.pack
+    // and emos/mkboot.py (whose byte-for-byte parity is tested by test_agrees_with_mkboot).
     const fieldStart = 64;
     const fieldEnd = 576;
     if (!bootImg || bootImg.length < fieldEnd) {
@@ -3603,7 +3605,11 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     const used = nul < 0 ? field.length : nul;
     const existing = new TextDecoder().decode(field.slice(0, used));
     const argument = 'androidboot.selinux=permissive';
-    if (existing.split(/\s+/).includes(argument)) return new Uint8Array(bootImg);
+    const tokens = existing.split(/\s+/);
+    if (tokens.some(token => token.startsWith('androidboot.selinux=') && token !== argument)) {
+      throw new Error('Boot cmdline already specifies a conflicting androidboot.selinux value.');
+    }
+    if (tokens.includes(argument)) return new Uint8Array(bootImg);
 
     const needsSpace = used > 0 && !/\s/.test(existing.at(-1));
     const addition = new TextEncoder().encode(`${needsSpace ? ' ' : ''}${argument}`);

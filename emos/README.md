@@ -507,7 +507,9 @@ boots, which is what recovery is for.
 `androidboot.selinux=permissive` to the existing NUL-terminated field. It does
 not replace FireOS's `bootopt`, `rootwait`, `init`, build-variant or verity
 arguments, and it refuses to patch if the combined value cannot fit while
-retaining a terminator. Earlier wizard versions zeroed bytes 64-576 and wrote
+retaining a terminator. It also refuses an existing conflicting
+`androidboot.selinux=` value, because appending another token cannot safely
+override the first value. Earlier wizard versions zeroed bytes 64-576 and wrote
 only 51 bytes; the device happened to boot because LK supplied `root=`,
 `androidboot.hardware` and the rest, and the kernel defaults covered what was
 left. Slot B was the only reason the loss was visible.

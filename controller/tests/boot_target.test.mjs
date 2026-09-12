@@ -112,6 +112,21 @@ function check(name, cond, detail) {
   check("an existing permissive argument is not duplicated", cmdline === original, cmdline);
 }
 
+// Conflicting values cannot be overridden safely by appending another token.
+for (const original of [
+  "rootwait androidboot.selinux=enforce",
+  "androidboot.selinux=enforce androidboot.selinux=permissive",
+  "androidboot.selinux=permissive androidboot.selinux=enforce",
+]) {
+  const image = new Uint8Array(576);
+  image.set(new TextEncoder().encode(original), 64);
+  const before = new Uint8Array(image);
+  let error = "";
+  try { patchBootCmdline(image); } catch (e) { error = e.message; }
+  check("a conflicting SELinux argument is refused", /conflicting/.test(error), original);
+  check("a rejected image is unchanged", image.every((byte, i) => byte === before[i]));
+}
+
 // A full field must be refused. Truncation would silently remove a FireOS
 // argument, which is the same invariant violation as replacing the field.
 {
