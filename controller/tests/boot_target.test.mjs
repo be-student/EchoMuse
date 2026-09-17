@@ -336,6 +336,66 @@ for (const [part, dev] of [["boot_a", "/dev/block/mmcblk0p17"],
   }
 }
 
+// Drive the real caller with an in-memory device transport. A substring in
+// magiskboot's log must not bypass token replacement or field validation.
+for (const [original, outcome] of [
+  ["androidboot.selinux=enforce androidboot.selinux=permissive", "patch"],
+  ["x=androidboot.selinux=permissive androidboot.selinux=enforce", "patch"],
+  ["androidboot.selinux=permissive_suffix", "reject"],
+  ["androidboot.selinux=unknown androidboot.selinux=permissive", "reject"],
+  ["androidboot.selinux=permissive " + "x".repeat(483), "reject"],
+  ["rootwait androidboot.selinux=permissive ro", "skip"],
+]) {
+  const image = new Uint8Array(640);
+  image.set(new TextEncoder().encode("ANDROID!"));
+  image.set(new TextEncoder().encode(original), 64);
+  const before = new Uint8Array(image);
+  const pushes = [], commands = [], logs = [];
+  const stopAfterPush = new Error("test stops before flashing");
+  const c = {
+    async shell(command) {
+      commands.push(command);
+      if (command.startsWith("d=")) return probe("/dev/block/mmcblk0p10");
+      if (command.includes("magiskboot unpack")) return `CMDLINE [${original}]`;
+      return "";
+    },
+    async pull(path) {
+      if (path === "/tmp/work/boot.img") return image;
+      if (path === "/tmp/ramdisk/init.csm.project.rc") {
+        return new TextEncoder().encode("service echomuse");
+      }
+      throw new Error(`unexpected pull: ${path}`);
+    },
+    async push(path, bytes) {
+      pushes.push({ path, bytes });
+      throw stopAfterPush;
+    },
+  };
+  const runPatchBoot = new Function("classifyBootTarget", "patchBootCmdline", "addLog",
+    "setProgress", "_INIT_RC_APPEND", `return async ${liftFunction("runPatchBoot")}`)(
+      classifyBootTarget, patchBootCmdline, text => logs.push(text), () => {}, "");
+  let error;
+  try { await runPatchBoot(c); } catch (e) { error = e; }
+  if (outcome === "patch") {
+    check("the caller pushes a corrected image", error === stopAfterPush &&
+          pushes.length === 1 && pushes[0].path === "/tmp/work/boot_patched.img", original);
+    if (pushes.length) {
+      const expected = patchBootCmdline(image);
+      check("the caller sends the bounded transformation", expected.every(
+        (byte, i) => pushes[0].bytes[i] === byte));
+    }
+  } else if (outcome === "reject") {
+    check("the caller rejects invalid cmdlines before writing", !!error &&
+          /conflicting|terminator/.test(error.message) && pushes.length === 0, original);
+  } else {
+    check("an already patched image avoids another write", !error && pushes.length === 0 &&
+          logs.includes("Boot image already fully patched — nothing to flash."), error?.message);
+  }
+  check("the caller leaves the pulled image unchanged", image.every((byte, i) => byte === before[i]));
+  check("the test never reaches a flash command", !commands.some(command =>
+        command.startsWith("dd if=/tmp/work/new-boot.img")));
+}
+
 if (failures) {
   console.error(`\n${failures} check(s) failed.`);
   process.exit(1);

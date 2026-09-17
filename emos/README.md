@@ -512,7 +512,10 @@ retaining a terminator. It replaces each existing
 `androidboot.selinux=enforce` token in place with
 `androidboot.selinux=permissive`, preserving all other argument bytes and
 whitespace. Other unknown SELinux values are refused. Appending a duplicate
-cannot safely override the first value. Earlier wizard versions zeroed bytes
+cannot safely override the first value. The wizard validates the actual field
+even when the unpack log contains `permissive`; it skips rewriting the cmdline
+only when the bounded transformation leaves the image unchanged.
+Earlier wizard versions zeroed bytes
 64-576 and wrote
 only 51 bytes; the device happened to boot because LK supplied `root=`,
 `androidboot.hardware` and the rest, and the kernel defaults covered what was
