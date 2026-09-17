@@ -3586,13 +3586,13 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
   // block any device whose TWRP lays that directory out differently — the same
   // reading the OTA free-space check applies to an unreadable df.
   // Android boot image v0-v2 stores a 512-byte, NUL-terminated cmdline at
-  // bytes 64..575. The wizard only owns the permissive argument: FireOS's
-  // existing arguments remain byte-for-byte at the front of the field, and
-  // bytes outside the field are never touched. Refuse an image that cannot
-  // hold the appended argument rather than truncating an existing argument.
+  // bytes 64..575. The wizard only owns the SELinux argument: replace an
+  // existing enforce token in place, or append permissive if absent, keeping
+  // every other argument and all bytes outside the field untouched.
   function patchBootCmdline(bootImg) {
-    // Keep the field bounds and append-only rules aligned with em_emos_build.pack
+    // Keep the field bounds and terminator rules aligned with em_emos_build.pack
     // and emos/mkboot.py (whose byte-for-byte parity is tested by test_agrees_with_mkboot).
+    // This wizard additionally replaces enforce: the first occurrence wins.
     const fieldStart = 64;
     const fieldEnd = 576;
     if (!bootImg || bootImg.length < fieldEnd) {
@@ -3601,28 +3601,34 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     }
 
     const field = bootImg.slice(fieldStart, fieldEnd);
-    const nul = field.indexOf(0);
-    const used = nul < 0 ? field.length : nul;
-    const existing = new TextDecoder().decode(field.slice(0, used));
+    const used = field.indexOf(0);
+    if (used < 0) throw new Error('Boot cmdline has no NUL terminator in its field.');
+    // Map each byte to one character so unrelated, even non-UTF-8, bytes are
+    // copied exactly rather than replaced by the text decoder.
+    const existing = String.fromCharCode(...field.slice(0, used));
     const argument = 'androidboot.selinux=permissive';
-    const tokens = existing.split(/\s+/);
-    if (tokens.some(token => token.startsWith('androidboot.selinux=') && token !== argument)) {
-      throw new Error('Boot cmdline already specifies a conflicting androidboot.selinux value.');
+    let found = false;
+    let cmdline = existing.replace(/(^|[ \t\r\n\v\f])androidboot\.selinux=([^ \t\r\n\v\f]*)/g,
+      (token, space, value) => {
+        if (value !== 'enforce' && value !== 'permissive') {
+          throw new Error('Boot cmdline already specifies a conflicting androidboot.selinux value.');
+        }
+        found = true;
+        return space + argument;
+      });
+    if (!found) {
+      const needsSpace = used > 0 && !/[ \t\r\n\v\f]/.test(existing.at(-1));
+      cmdline += `${needsSpace ? ' ' : ''}${argument}`;
     }
-    if (tokens.includes(argument)) return new Uint8Array(bootImg);
-
-    const needsSpace = used > 0 && !/\s/.test(existing.at(-1));
-    const addition = new TextEncoder().encode(`${needsSpace ? ' ' : ''}${argument}`);
-    // Keep one byte for the terminator. A full field is not a valid patch even
-    // if the kernel would happen to stop reading at the field boundary.
-    if (used + addition.length >= field.length) {
+    // Keep one byte for the terminator; never truncate a FireOS argument.
+    if (cmdline.length >= field.length) {
       throw new Error(
-        `Boot cmdline is too long to append ${argument} without truncating FireOS arguments.`);
+        `Boot cmdline is too long to set ${argument} without truncating FireOS arguments.`);
     }
 
     const patched = new Uint8Array(bootImg);
-    patched.set(addition, fieldStart + used);
-    patched[fieldStart + used + addition.length] = 0;
+    patched.set(Uint8Array.from(cmdline, char => char.charCodeAt(0)), fieldStart);
+    patched[fieldStart + cmdline.length] = 0;
     return patched;
   }
 

@@ -504,12 +504,16 @@ cmdline or the `service echomuse` init entry, so EchoMuse does not start. It
 boots, which is what recovery is for.
 
 **The cmdline patch preserves the original arguments.** `runPatchBoot` appends
-`androidboot.selinux=permissive` to the existing NUL-terminated field. It does
+`androidboot.selinux=permissive` to the existing NUL-terminated field if absent.
+It does
 not replace FireOS's `bootopt`, `rootwait`, `init`, build-variant or verity
 arguments, and it refuses to patch if the combined value cannot fit while
-retaining a terminator. It also refuses an existing conflicting
-`androidboot.selinux=` value, because appending another token cannot safely
-override the first value. Earlier wizard versions zeroed bytes 64-576 and wrote
+retaining a terminator. It replaces each existing
+`androidboot.selinux=enforce` token in place with
+`androidboot.selinux=permissive`, preserving all other argument bytes and
+whitespace. Other unknown SELinux values are refused. Appending a duplicate
+cannot safely override the first value. Earlier wizard versions zeroed bytes
+64-576 and wrote
 only 51 bytes; the device happened to boot because LK supplied `root=`,
 `androidboot.hardware` and the rest, and the kernel defaults covered what was
 left. Slot B was the only reason the loss was visible.

@@ -112,19 +112,103 @@ function check(name, cond, detail) {
   check("an existing permissive argument is not duplicated", cmdline === original, cmdline);
 }
 
-// Conflicting values cannot be overridden safely by appending another token.
+// First occurrence wins, so replace each enforce token where it appears.
+// Keep whitespace, unrelated arguments and bytes outside the field intact.
 for (const original of [
-  "rootwait androidboot.selinux=enforce",
+  "rootwait androidboot.selinux=enforce ro init=/init",
   "androidboot.selinux=enforce androidboot.selinux=permissive",
   "androidboot.selinux=permissive androidboot.selinux=enforce",
+  "androidboot.selinux=enforce androidboot.selinux=enforce",
+  "  rootwait\tandroidboot.selinux=enforce\t ro  ",
 ]) {
-  const image = new Uint8Array(576);
+  const image = new Uint8Array(640).fill(0xa5);
+  image.fill(0, 64, 576);
   image.set(new TextEncoder().encode(original), 64);
   const before = new Uint8Array(image);
+  let patched;
+  try { patched = patchBootCmdline(image); } catch (e) {
+    check("an enforce token is replaced instead of refused", false, e.message);
+    continue;
+  }
+  const end = patched.indexOf(0, 64);
+  const expected = original.replaceAll("androidboot.selinux=enforce", "androidboot.selinux=permissive");
+  check("enforce tokens are replaced in place",
+        new TextDecoder().decode(patched.slice(64, end)) === expected, original);
+  check("replacement does not mutate the input", image.every((byte, i) => byte === before[i]));
+  check("replacement leaves all bytes outside the field untouched",
+        patched.every((byte, i) => (i >= 64 && i < 576) || byte === before[i]));
+  check("replacement is idempotent",
+        patchBootCmdline(patched).every((byte, i) => byte === patched[i]));
+}
+
+// Replacement may grow the field, but must still leave a NUL terminator.
+for (const outputLength of [511, 512]) {
+  const original = "x".repeat(outputLength - " androidboot.selinux=permissive".length)
+    + " androidboot.selinux=enforce";
+  const image = new Uint8Array(640).fill(0xa5);
+  image.fill(0, 64, 576);
+  image.set(new TextEncoder().encode(original), 64);
+  const before = new Uint8Array(image);
+  let patched, error = "";
+  try { patched = patchBootCmdline(image); } catch (e) { error = e.message; }
+  if (outputLength === 511) {
+    check("replacement fits exactly with its terminator", !!patched && patched[575] === 0, error);
+    check("exact-fit replacement preserves the following byte", !!patched && patched[576] === 0xa5);
+  } else {
+    check("replacement without space for a terminator is refused", /too long/i.test(error), error);
+  }
+  check("boundary handling does not mutate the input", image.every((byte, i) => byte === before[i]));
+}
+
+// A token-like substring in an unrelated argument is not rewritten. Even
+// non-UTF-8 bytes in those arguments must survive replacement byte-for-byte.
+{
+  const original = new TextEncoder().encode("x=androidboot.selinux=enforce rootwait androidboot.selinux=enforce");
+  original[0] = 0xff;
+  const image = new Uint8Array(576);
+  image.set(original, 64);
+  let patched;
+  try { patched = patchBootCmdline(image); } catch (e) {
+    check("replacement accepts unrelated opaque bytes", false, e.message);
+  }
+  const prefixLength = "x=androidboot.selinux=enforce rootwait ".length;
+  check("unrelated bytes survive replacement exactly", !!patched &&
+        original.slice(0, prefixLength).every((byte, i) => patched[64 + i] === byte));
+}
+
+// Unsupported values still require an explicit decision instead of guessing.
+{
+  const image = new Uint8Array(576);
+  image.set(new TextEncoder().encode("androidboot.selinux=unknown"), 64);
   let error = "";
   try { patchBootCmdline(image); } catch (e) { error = e.message; }
-  check("a conflicting SELinux argument is refused", /conflicting/.test(error), original);
-  check("a rejected image is unchanged", image.every((byte, i) => byte === before[i]));
+  check("an unknown SELinux value is refused", /conflicting/.test(error), error);
+}
+
+// A full field without a terminator cannot be returned as an already-patched image.
+{
+  const image = new Uint8Array(576).fill(0x78);
+  image.set(new TextEncoder().encode("androidboot.selinux=permissive "), 64);
+  let error = "";
+  try { patchBootCmdline(image); } catch (e) { error = e.message; }
+  check("a missing terminator is refused", /terminator/i.test(error), error);
+}
+
+// Both append and replacement obey the same 511-byte payload limit.
+for (const outputLength of [511, 512]) {
+  const original = "x".repeat(outputLength - " androidboot.selinux=permissive".length);
+  const image = new Uint8Array(576);
+  image.set(new TextEncoder().encode(original), 64);
+  let patched, error = "";
+  try { patched = patchBootCmdline(image); } catch (e) { error = e.message; }
+  check(`append boundary at ${outputLength} bytes`, outputLength === 511
+        ? !!patched && patched[575] === 0 : /too long/i.test(error), error);
+}
+
+for (const size of [0, 63, 64, 575]) {
+  let error = "";
+  try { patchBootCmdline(new Uint8Array(size)); } catch (e) { error = e.message; }
+  check(`an incomplete field of ${size} bytes is refused`, /too short/i.test(error), error);
 }
 
 // A full field must be refused. Truncation would silently remove a FireOS
