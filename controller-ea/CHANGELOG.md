@@ -1,5 +1,404 @@
 # Changelog
 
+## 2.24.0-ea.6 (Early Access)
+
+**The emOS image now carries the `/system` it was built beside** (#545). The
+wizard resolved the right partition and logged which one it had chosen, and
+the build endpoint then dropped the value: its multipart parser had no branch
+for that field, so it was discarded without an error. Every emOS image was
+built with no `emos.system=` stamp, and emOS fell back to the partition it
+hardcoded before the stamp existed — the right one about half the time. On a
+device whose stock FireOS sits in slot B it mounts the wrong userspace, and
+boots anyway. Reported by @jthoward64.
+
+An image provisioned since emOS 0.6 carries no stamp. Rebuild and reflash from
+the wizard to get one.
+
+**The connect step reads what the device can actually tell it** (#517). On a
+device unlocked with amonet v2 the wizard could not read the FireOS build, the
+Android release or the device identity at all — it looked for the by-name map
+in one location and v2 lays it out in another. Step 1 reported "Could not read
+/system/build.prop" and offered no diagnostics download. All three now work,
+and an unreadable release skips the version check rather than guessing at it.
+
+**A wake sensitivity that can never fire is no longer stored.** openwakeword's
+score approaches 1.0 without reaching it and the comparison is
+greater-than-or-equal, so a threshold of exactly 1.0 is a bar nothing clears:
+the device scores perfectly and never wakes, which reads as one that has
+stopped responding. Values above 0.975 are held at 0.975 on save.
+
+## 2.24.0-ea.5 (Early Access)
+
+**Provisioning a FireOS 6 device no longer overwrites the stock boot image**
+(#525). The wizard wrote emOS over the slot the device had booted from, which
+on a stock device is the slot holding the only copy of Amazon's boot image.
+That image is the reference any future emOS build is made from, and the only
+way back to FireOS. EchoMuse ships neither a kernel nor a userspace, so once
+both slots held emOS there was nothing left on the device to rebuild from.
+
+The wizard now reads both slots, keeps the stock one, writes emOS to the other
+and points the bootloader at it.
+
+**If your device was provisioned before this release, both slots already hold
+emOS and the wizard will refuse to provision it again.** It names the boot
+image you escrowed during provisioning as the way out. Keep that file — on this
+hardware it cannot be recovered from anywhere else. Restoring it to one slot
+puts the device back in a state the wizard can work with.
+
+**emOS ships its own busybox** (#524), so a device no longer depends on tools a
+third-party root happened to leave behind. A plain stock FireOS 6 install has
+none, which is why some devices booted emOS, joined the WiFi and then never got
+an IP address. DHCP, the system log and the console all use our own copy now.
+
+Requires emOS 0.6 or later. The wizard fetches it automatically.
+
+**Fixes the controller's memory growing by roughly a gigabyte a day on a busy
+fleet** (#512, @scragnog). Every time a device reconnected, the controller
+built a fresh copy of the wake word model and never released the old one — 50
+copies and about 2.5 GB over three days. Models are now kept per device and
+reused across reconnects.
+
+## 2.24.0-ea.4 (Early Access)
+
+**Fixes the flash step reporting that a write did not take, on a device where
+nothing had been written at all** (#520).
+
+The wizard asked the device to copy the image with an option its recovery does
+not support, so the copy never happened. What you saw was an impossible write
+speed, then a partition that still held the old image, then an automatic retry
+doing exactly the same thing. Your device was never modified.
+
+The wizard now asks whether that option is available and leaves it out where it
+is not. Every write is still followed by a flush and checked by reading the
+partition back, which is what actually proves an image landed.
+
+**It also now tells the two cases apart.** A copy that never ran and a copy
+that failed looked identical, and only one of them means anything is wrong with
+your device. If the tool refuses to run, the wizard says so in its own words
+and tells you the partition is untouched, instead of reporting a mismatch.
+
+## 2.24.0-ea.3 (Early Access)
+
+**Fixes the wizard stopping at the Install EchoMuse step with "start_server.sh
+reads unreadable"** (#516). The file was installed correctly. Only the check
+that confirms it could not run.
+
+The wizard was asking the device to hash files with busybox, and a recovery
+does not always have it — a stock FireOS 6 install carries a different set of
+tools. It now asks the device which tools it has and uses those, so both kinds
+of recovery work.
+
+This also affected the flash step, which verifies the image on the device
+before writing it and reads the partition back afterwards. Both used the same
+missing tool, so a device that got past the install step would have stopped
+there instead. Neither could ever have written something unverified — they
+refuse rather than continue — but the run could not finish.
+
+If the recovery turns out to have no usable tool at all, the wizard now says
+which one is missing and stops before writing anything, rather than reporting
+the file as corrupt.
+
+## 2.24.0-ea.2 (Early Access)
+
+**Fixes the wizard stopping at the Escrow Boot Image step on a device unlocked
+with amonet-biscuit v2.0.0** (#513). It refused with a message about
+`/dev/block/other-boot` not being a block device, and nothing was read or
+written.
+
+That unlock arranges the partitions differently from the older one, and the
+wizard assumed the older layout everywhere. It now recognises both, and reads
+which of the two boot slots your device actually started from rather than
+assuming — v2 devices switch slots when you install a FireOS update, so
+guessing would write to the slot the device is not using and look like the
+flash had done nothing.
+
+If it cannot tell which slot booted, it refuses rather than picking one.
+
+This has been through the test suite against the partition layout read off a
+real v2 device, and has not yet run on hardware.
+
+## 2.24.0-ea.1 (Early Access)
+
+**The setup wizard can now install emOS on a device unlocked with
+amonet-biscuit v2.0.0.** That unlock only boots FireOS 6, and until now those
+devices had no path through the wizard at all.
+
+This needs emOS 0.5 or newer. On an older emOS release the build refuses with a
+message naming the problem, rather than producing an image that will not boot.
+
+The FireOS 6 path has been through CI and host tests. It has not yet run on
+hardware, which is what Early Access is for.
+
+**The wizard picks the init to match your device's kernel.** It reads the
+architecture out of the boot image you escrowed, so a 32-bit device gets the
+32-bit init. An init of the wrong architecture boots to nothing at all, with no
+output, so this is detected rather than left as a setting you could get wrong.
+If the architecture cannot be read, the build refuses instead of guessing.
+
+**amonet v2.0.0 devices are accepted by the emOS flow.** 2.23.1 refused them at
+the first step, because the FireOS path genuinely cannot work on FireOS 6. That
+refusal stays for the FireOS flow. Only the emOS flow accepts them.
+
+**Changing WiFi and scanning for networks now work on emOS.** Those went
+through an Android command that emOS does not have, so the controller writes the
+network and restarts the supplicant instead.
+
+Also in this release: the dashboard tells you when a tab has gone stale against
+a newer controller, and the init is now fetched by the controller rather than
+uploaded by your browser, which takes about 3.5MB out of a request that has hit
+Home Assistant's ingress size limit before.
+
+No database migration. No firmware update.
+
+## 2.23.1-ea.1 (Early Access)
+
+**Brings Early Access level with 2.23.1.** That's the fix for the add-on not
+starting on Proxmox VMs using the `kvm64` CPU type (see 2.23.1 below), plus one
+change that was in 2.23.0 but never had an Early Access build: the USB console
+idle timeout is now a number box rather than a slider, so any whole number of
+minutes can be entered.
+
+No database migration, no firmware update.
+
+## 2.23.1
+
+**Fixed: the add-on would not start on Proxmox VMs using the `kvm64` CPU
+type** (#496). It stopped at startup with `NumPy was built with baseline
+optimizations: (X86_V2) but your machine doesn't support: (X86_V2)`.
+
+NumPy 2.4 needs a newer CPU than `kvm64` provides, which is why Home
+Assistant's other add-ons ran fine and this one did not. EchoMuse now uses
+NumPy 2.3.5, which runs the whole controller on `kvm64` at the same speed and
+with the same wake word scores. A new build check runs every image on an
+emulated `kvm64` CPU, so a later update cannot bring this back unnoticed.
+
+If you switched your VM's CPU type to work around this, you can leave it as it
+is. No database migration, no firmware update, and nothing to do on your
+devices.
+
+## 2.23.0
+
+The Early Access work from ea.1 to ea.15, in one release. The headline is that
+**an Echo can now run without any of Amazon's software on it**, but most of
+this is voice turns behaving the way you expected them to already.
+
+### Your Echo can run without Amazon's software
+
+**emOS replaces Android on the device entirely**, keeping Amazon's kernel and
+nothing above it. The setup wizard installs it, and it is now the option the
+wizard offers first — FireOS is still there, one click away, labelled, and is
+what every device in the field is running today.
+
+Two reasons it is the default rather than the adventurous choice. Amazon's
+audio layer cannot be evicted while Android is running, which is why the 3.5mm
+jack behaves properly on emOS and imperfectly on FireOS. And FireOS is not the
+safe option so much as the known-bad one we understand.
+
+**Before you choose it**, two things are worth knowing. The wizard escrows your
+original boot image before it writes anything, and restoring that takes about
+ten seconds and leaves everything on the device alone — this has been used in
+anger and it works. And a device already running emOS cannot be re-run through
+the wizard; getting back means going through TWRP, which is a cable and a
+button press rather than a dead end.
+
+### Voice turns
+
+**Fixed: some commands took fifteen seconds to answer.** Speaking immediately
+after the wake word, or saying something short like "stop", could leave the
+Echo silent for about fifteen seconds while the same words after a pause came
+back in three. The cause is in Home Assistant's end-of-speech detection rather
+than here — it is reported upstream as home-assistant/core#181747 — and the
+controller now stops waiting on it instead of sitting out the full fifteen
+seconds. Reported by **@maxwellh**.
+
+**Fixed: long spoken answers were cut off part-way through.** The controller
+sent audio faster than the Echo could play it, which eventually broke the
+connection mid-sentence. Short answers never showed it, which is why this
+looked intermittent for so long.
+
+**Fixed: interrupting your Echo mid-response.** Barge-in never actually worked
+— the interrupting turn died in milliseconds every time. It also used to fire
+on its own voice during long answers, cutting them off and then ignoring you.
+
+**Fixed: the Echo threw away the question you had just asked**, in three
+separate ways, and stopped answering after a timer was dismissed mid-chime.
+
+**Timers ring on the Echo itself**, with the chime coming from the device, and
+stopping one no longer leaves it deaf.
+
+**Home Assistant can ask your Echo a question** and wait for the answer —
+`assist_satellite.ask_question` and `start_conversation` both work, including
+the attention chime.
+
+**Fixed: noise suppression could cut speech to complete silence** rather than
+merely cleaning it up.
+
+### The light ring tells you more
+
+An Echo with no Home Assistant behind it now says so **every time** you speak
+to it, rather than lighting up and going dark as though it were thinking. The
+ring also stops listening visibly whichever way the turn started, and says when
+there is nothing available to answer you.
+
+### Sound
+
+**The headphone jack works properly.** Plugging in during playback, unplugging,
+and booting with something already plugged in all behave.
+
+**The Bluetooth proxy no longer crowds out the device running it.** Advertisements
+were sharing a connection with the keepalive traffic, so the Echo doing proxy
+duty had a measurably worse link than the others.
+
+### Setup
+
+**The wizard is considerably easier to follow** — a progress bar, numbered
+steps, a visible indicator while it waits on the Echo, and a failure panel that
+puts the useful action in front of you. Thanks to **@Mr-Neutr0n** for this and
+for the WiFi fix below.
+
+**Fixed: WiFi stopped reconnecting after a reboot on a network with no internet
+access.** Android decides such a network is bad and eventually refuses to
+auto-join it.
+
+**If your browser cannot do USB, the wizard says so on the first step**, naming
+your exact address, rather than at the first click with an Echo already
+unboxed.
+
+**Fixed: setting up a device that already had a console password could not
+finish.** The password survives a reinstall, so a device set up again — or
+moved from somebody else's EchoMuse — arrived still holding it. Provisioning
+now clears it and the controller puts it back when the device connects. If you
+are taking on an Echo from someone else, their password should not follow the
+hardware to you.
+
+### Smaller things
+
+- **Your Echoes know what time it is.** An Echo has no clock that survives a
+  power cut, and under emOS nothing was correcting it.
+- **Custom wake word models carry their own name and language**, instead of
+  being renamed by the file they arrived in.
+- **Deleting an Echo actually removes it.** It used to keep serving turns.
+- **An Echo running emOS can have a password on its USB console**, with an idle
+  timeout.
+- **Updates no longer stall** pushing Android-only payloads at a device with no
+  Android on it.
+- Two announcements or timers playing at once no longer collide.
+- Config → Microphones → Advanced gains an echo-reference control, for testing
+  echo cancellation on hardware that supports it.
+
+### Before you update
+
+Nothing to do — the database migrates itself, and there is no manual step.
+
+**Some of this needs device firmware v2.15.0**, released alongside this. The
+jack fixes, the clock and the echo reference are device changes, so update the
+controller first and then your Echoes from the Updates tab — until you do,
+those settings are stored and ignored. Everything else here is controller-side
+and works as soon as you update.
+
+**emOS devices want emOS 0.4**, also released alongside this, which is what
+the wizard installs from now on. A device already on 0.3 keeps working; it
+just has no `/init recovery` and no console idle timeout.
+
+## 2.23.0-ea.15 (Early Access)
+
+**Fixed: some commands took fifteen seconds to answer.** If you spoke
+immediately after the wake word, or said something short like "stop", the Echo
+would sit there for about fifteen seconds before replying — while the same
+words, said after a half-second pause, came back in three. Reported by
+**@maxwellh**, with a support bundle that made it findable.
+
+The wait was not ours. Home Assistant decides when you have stopped speaking,
+and before it can do that it has to decide you STARTED — which needs about a
+third of a second of speech it is confident about. A short command, or one that
+begins before its microphone analysis has warmed up, never clears that bar, so
+Home Assistant stops waiting only when its own fifteen-second limit runs out,
+and reports that as though you had simply finished talking. Nothing in the
+message it sends says otherwise, which is why this looked for months like the
+Echo being slow.
+
+The controller now notices when that has happened and ends the turn itself,
+about a second after you stop speaking. While Home Assistant's own detection is
+working — the ordinary case — nothing changes: its judgement is better than
+ours and it still decides. This was firing on roughly one wake in thirty here,
+and about half of those came back with no answer at all.
+
+Each turn now also records whether Home Assistant's detection ever engaged, so
+this is countable rather than something you notice and doubt. If a command
+still takes fifteen seconds, that is worth reporting with a support bundle.
+
+**Fixed: provisioning a device that already had a console password set could
+not finish.** The password lives in a part of the device that a reinstall
+deliberately leaves alone, so a device moved between EchoMuse setups — or
+simply set up again — arrived still holding it, and the setup wizard had no way
+past the prompt. It reported that the device's console "did not answer", which
+pointed at the boot, the flash and the image rather than at a login, and the
+device itself was fine throughout.
+
+Provisioning now clears the console password along with the old install, and
+the controller puts it back when the device next connects. If you are moving an
+Echo from somebody else's EchoMuse, this is also the right behaviour on its own
+account: their password should not follow the hardware to you.
+
+## 2.23.0-ea.14 (Early Access)
+
+**You can now choose which operating system the wizard installs.** The first
+step offers emOS or FireOS side by side, each with the one line that actually
+separates them, and emOS stays the default. FireOS keeps Android underneath and
+is what every device in the field runs; emOS removes Amazon's software
+entirely, which is also why the 3.5mm jack behaves properly on it. Setting
+`?flow=fireos` on the dashboard URL still works and still wins.
+
+**The wizard now says what to watch on an emOS device's first boot, before it
+reboots rather than after something goes wrong.** The light ring already told
+you which of five states you were in; that table was only in a file written for
+people building emOS. Four of the five need nothing from you — including solid
+amber, which means the Echo is restoring its own last known-good image and
+should be left alone. The fifth, a single segment orbiting a full blue ring,
+means emOS never started, and it is the only one that needs you.
+
+If that happens, **do not keep power cycling it** — that is what turns an Echo
+you can fix with a cable into one that needs the case opened. Unplug the power,
+hold the mute button, apply power still holding it, and wait for the
+alternating cyan ring; you are in TWRP, and restoring the boot image the wizard
+escrowed for you takes about ten seconds and leaves everything on the device
+alone. This is written out properly in the rooting guide now too.
+
+**If your browser cannot do USB, the wizard says so on the first step** rather
+than at the first click with an Echo already unboxed and plugged in. It names
+your exact address, which matters because the browser flag matches it exactly —
+an entry added for a different address silently does nothing.
+
+**The wizard is easier to follow.** A progress bar and numbered steps, a
+visible indicator while it is waiting on the Echo rather than a silent pause, a
+preview of what is coming next, and a failure panel that puts the action you
+want in front of you instead of a row of equal buttons. Thanks to
+**@Mr-Neutr0n** for this and for the WiFi fix below.
+
+**Fixed: WiFi stops reconnecting after a reboot on a network with no internet
+access.** Android counts the network as bad and eventually refuses to auto-join
+it. The wizard now turns that check off during setup and clears the counter
+that had already built up, so a device provisioned onto a network it used under
+Alexa recovers too.
+
+**Custom wake word models now carry their own name and language.** A model
+trained in the wake word trainer is stamped with the phrase it was actually
+trained on, so Home Assistant shows that rather than a name guessed from the
+filename — which could only ever be one phrase, even for a model trained on
+several, and was always English. Models without that stamp, including every
+stock one, keep the existing behaviour. Thanks to **@be-student**.
+
+One thing to expect the first time you update: stamping changes each model's
+checksum, so every custom model is pushed to its devices once more. They are
+about 1.2MB and the push is verified, so it costs a few seconds and nothing
+else.
+
+**Fixed: repacking an emOS image added a second copy of its own boot
+parameters** each time, so an Echo updated in place three times would refuse to
+build a fourth image. **The emOS console now carries a banner** with the
+device's name, address, controller and uptime, and its network log stays in
+memory rather than writing to the Echo's flash every five seconds.
+
 ## 2.23.0-ea.13 (Early Access)
 
 **The setup wizard now tells you when it has finished.** Setup flow only.

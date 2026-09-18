@@ -58,6 +58,7 @@ import em_auth as auth
 import em_ble_proxy
 import em_config_sections as sections_mod
 import em_console_pw
+import em_crashlog
 import em_emos_build
 import em_firmware
 import em_ingressauth
@@ -500,6 +501,25 @@ async def _serve_spa(request: web.Request) -> web.Response:
     )
 
 
+def _bundle_version() -> str:
+    """The dashboard bundle's mtime, as the string used in its URL.
+
+    One function so `_serve_dashboard` (which stamps it) and
+    `/api/system/status` (which publishes it for comparison) cannot disagree
+    about what identifies a build. Two call sites deriving the same value
+    independently is how a staleness check ends up permanently stale, or
+    permanently fresh, with nothing to show for it either way.
+
+    An unreadable bundle returns "", which compares equal to the "" a client
+    reports when it cannot find its own script tag — so the check degrades to
+    "say nothing" rather than to a reload prompt nobody can satisfy.
+    """
+    try:
+        return str(int((STATIC_DIR / "dashboard.js").stat().st_mtime))
+    except OSError:
+        return ""
+
+
 async def _serve_dashboard(request: web.Request) -> web.Response:
     """
     Serve dashboard.html for /dashboard, with the JS bundle cache-busted.
@@ -522,11 +542,11 @@ async def _serve_dashboard(request: web.Request) -> web.Response:
     if not dashboard.exists():
         return web.Response(status=503, text="dashboard.html not found in static/")
     page = _with_ingress_base(dashboard.read_text(encoding="utf-8"), request)
-    bundle = STATIC_DIR / "dashboard.js"
-    if bundle.exists():
+    stamp = _bundle_version()
+    if stamp:
         page = page.replace(
             "static/dashboard.js",
-            f"static/dashboard.js?v={int(bundle.stat().st_mtime)}",
+            f"static/dashboard.js?v={stamp}",
         )
     return web.Response(
         text=page,
@@ -1007,6 +1027,13 @@ async def _delete_device(request: web.Request) -> web.Response:
     # silently. Lazy import — em_esphome imports em_api at module level.
     import em_esphome
     await em_esphome.device_deleted(device_id)
+    # Free the device's cached OWW models (#512), or a deleted device keeps its
+    # models — and their ONNX sessions — for the life of the process. Resolve
+    # the RUNNING controller module (not a fresh import) for the same reason
+    # _running_controller_module exists.
+    ctrl = _running_controller_module()
+    if ctrl is not None:
+        ctrl._forget_oww_models(device_id)
     # A re-added device is the one whose payloads are least likely to be
     # right, so it must not inherit the deleted row's debounce and skip its
     # first reconcile — the bounce below has it redialling within seconds.
@@ -1102,7 +1129,7 @@ async def _apply_live_config(device_id: str, live, effective: dict) -> None:
         # Refresh HA's wake-word dropdown (lazy import — em_esphome imports
         # em_api at module level).
         import em_esphome
-        em_esphome.update_oww_model(device_id, effective["owwModel"])
+        await em_esphome.update_oww_model(device_id, effective["owwModel"])
     if pending_model:
         # The device is still on its previous wake word, still scoring
         # locally, still answering. Install, then switch.
@@ -1257,6 +1284,11 @@ async def _post_device_config(request: web.Request) -> web.Response:
             f"replace=true if the deletion is intended.",
             409,
         )
+
+    # Validated BEFORE anything is written: a refusal must leave the stored
+    # config untouched, not half-applied with the bad key rejected later.
+    if (err := _validate_console_timeout(body)):
+        return _error("bad_console_timeout", err, 400)
 
     # Apply scoping first: set_device_config_sections prunes the values of
     # any section no longer overridden, so what follows writes into an
@@ -1884,10 +1916,33 @@ async def _run_update_locked(device_id: str, release: dict,
 
         # Sync the startup script while we're here — OTA is the only update
         # path existing devices have for it (see _sync_start_script).
+        #
+        # NOT gated on the platform, deliberately: emOS runs this same script.
+        # Its init supervises `/system/bin/sh /data/local/bin/start_server.sh`
+        # (emos/init/init.c), because the script owns the A/B slot symlink and
+        # the fast-exit backoff, which both bases need. Gating it here by
+        # symmetry with the debloat below would strand emOS devices on whatever
+        # script they were provisioned with.
         await _sync_start_script(live, device_id)
         # Payload drift is not limited to the start script — the debloat
         # halves had no update path at all until 2026-07-30.
-        await _sync_debloat(live, device_id)
+        #
+        # Gated, because the debloat is Android-only: a pm-hide list and a
+        # Magisk service.d script, and emOS has neither a package manager nor
+        # Magisk. This was the THIRD call site of _sync_debloat and the only
+        # one that did not ask — reconcile_on_connect and _post_debloat both
+        # check. Found on EFF 2026-09-07 at its first OTA onto emOS: the
+        # transfer targeted /sbin/.core/img/.core/service.d/ on a device with
+        # no Magisk daemon to have created it.
+        #
+        # It cost only a wasted shell round trip because the destination
+        # directory probe caught it. Without that probe it is the 240s stall
+        # measured on this same device on 2026-09-04 — TRANSFER_OK never
+        # arrives and the transfer holds the shell lock for its full timeout,
+        # twice. The gate belongs here anyway: the probe bounds the damage of
+        # a payload that should never have been sent.
+        if live.android_userspace:
+            await _sync_debloat(live, device_id)
 
         inactive_slot = "server_b" if active_slot == "server_a" else "server_a"
 
@@ -3255,6 +3310,23 @@ async def _get_system_status(request: web.Request) -> web.Response:
 
     return _ok({
         "controller_version": CONTROLLER_VERSION,
+        # The mtime stamped onto the dashboard bundle's URL by
+        # _serve_dashboard, so a running page can tell whether the JavaScript
+        # it is executing is still the JavaScript this controller serves.
+        #
+        # A long-lived SPA tab survives an add-on update and keeps its old
+        # bundle indefinitely — the URL is cache-busted, but only on a page
+        # LOAD. Nothing in the page could notice, and `controller_version`
+        # above made it worse rather than better: it is read from the server,
+        # so it reports the NEW version while the page runs the OLD code.
+        # Measured 2026-09-10, when a wizard run on a stale tab silently
+        # skipped a provisioning step that had shipped hours earlier and the
+        # header cheerfully named a version whose code was not running.
+        #
+        # Compared rather than displayed, so it does not matter that an mtime
+        # is meaningless to a person; `version.py` cannot be used here because
+        # a local build is "dev" for every build and would never differ.
+        "bundle_version": _bundle_version(),
         # True when running as a Home Assistant add-on behind Supervisor's
         # ingress proxy. Presentation only — the dashboard is the same
         # dashboard either way, with the same features, and nothing should
@@ -3404,6 +3476,36 @@ def _resolve_console_pw(incoming: dict, stored: dict) -> None:
     )
 
 
+# The console idle timeout, in minutes: 0 for none, otherwise 1-90.
+_CONSOLE_TMOUT_KEY = "consoleTimeoutMin"
+_CONSOLE_TMOUT_MAX = 90
+
+
+def _validate_console_timeout(config: dict) -> str | None:
+    """
+    Return an error message when the timeout is out of range, else None.
+
+    REFUSED rather than clamped, deliberately. A value of 600 is somebody who
+    meant seconds, and silently giving them ten minutes is a console that logs
+    them out all day from a setting that looked accepted. The device refuses
+    it too — the controller validating first means a bad value reaching the
+    firmware is a bug rather than a user, but neither end assumes the other is
+    the careful one.
+
+    Absence is fine: it means the body did not mention the key.
+    """
+    if _CONSOLE_TMOUT_KEY not in config:
+        return None
+    v = config[_CONSOLE_TMOUT_KEY]
+    if isinstance(v, bool) or not isinstance(v, int):
+        return (f"{_CONSOLE_TMOUT_KEY} must be a whole number of minutes, "
+                f"got {v!r}")
+    if v < 0 or v > _CONSOLE_TMOUT_MAX:
+        return (f"{_CONSOLE_TMOUT_KEY} must be 0 (no timeout) or 1-"
+                f"{_CONSOLE_TMOUT_MAX} minutes, got {v}")
+    return None
+
+
 def _dropped_keys(incoming: dict, stored: dict) -> list[str]:
     """
     Keys present in the stored config that the incoming body would delete.
@@ -3446,6 +3548,8 @@ async def _post_global_config(request: web.Request) -> web.Response:
     # newly-added default must not look like a key this body is deleting.
     stored = await loop.run_in_executor(None, db.get_global_device_config_raw)
     _resolve_console_pw(config, stored)
+    if (err := _validate_console_timeout(config)):
+        return _error("bad_console_timeout", err, 400)
     dropped = _dropped_keys(config, stored)
     if dropped and not explicit_replace:
         return _error(
@@ -4081,7 +4185,7 @@ async def _install_then_switch(device_id: str, model: str) -> None:
     await live.send_control({"type": "config", **effective})
     live.oww_model = model
     import em_esphome
-    em_esphome.update_oww_model(device_id, model)
+    await em_esphome.update_oww_model(device_id, model)
     await _push_log_event(
         device_id, "info", "controller",
         f"Wake word model {model} installed — device switched"
@@ -4115,6 +4219,58 @@ def _reconcile_due(device_id: str, now: float,
     return True
 
 
+# How long to wait before asking again when the shell plane did not answer:
+# seconds after a register it is often not up yet.
+CRASH_LOG_RETRY_S = 10.0
+
+
+async def _collect_crash_log(live, device_id: str) -> None:
+    """
+    Report an emOS device's previous boot if it did not end cleanly.
+
+    emOS saves the ram console on every boot (em_crashlog explains how a crash
+    is told from a restart). A marker on the device records which copy has been
+    handled, so each boot is examined once however often the device reconnects,
+    and a controller restart does not report the same crash twice. The marker
+    is written only after a successful read, so a device that did not answer
+    is asked again on its next connect.
+    """
+    kmsg, seen = em_crashlog.KMSG_PATH, em_crashlog.SEEN_PATH
+    probe = ""
+    for attempt in range(2):
+        probe = await _shell_run(
+            live, f"busybox md5sum {kmsg} 2>/dev/null; cat {seen} 2>/dev/null; "
+                  f"echo {_SHELL_OK}")
+        if _SHELL_OK in probe:
+            break
+        if attempt == 0:
+            await asyncio.sleep(CRASH_LOG_RETRY_S)
+            if _devices.get(device_id) is not live:
+                return
+    else:
+        log.info(f"[api] [{device_id}] crash log: no answer from the device")
+        return
+    m = re.search(r"\b([0-9a-f]{32})\s+" + re.escape(kmsg), probe)
+    if not m:
+        return  # nothing saved: a cold boot, or init that predates the copy
+    md5 = m.group(1)
+    if probe.count(md5) > 1:
+        return  # this copy was already handled
+    await asyncio.sleep(1.0)  # let the probe's shell session close
+    out = await _shell_run(live, f"cat {kmsg}; echo {_SHELL_OK}", timeout=60.0)
+    if _SHELL_OK not in out:
+        log.info(f"[api] [{device_id}] crash log: read incomplete, will retry "
+                 f"on the next connect")
+        return
+    msg = em_crashlog.summarise(out[:out.rindex(_SHELL_OK)])
+    if msg:
+        log.warning(f"[api] [{device_id}] previous boot did not end cleanly — "
+                    f"kernel log saved to the device's log events")
+        await _push_log_event(device_id, "error", "kernel", msg)
+    await asyncio.sleep(1.0)
+    await _shell_run(live, f"echo {md5} > {seen}")
+
+
 async def reconcile_on_connect(device_id: str, live) -> None:
     """
     Bring a freshly-connected device's three installed payloads back in line.
@@ -4143,7 +4299,16 @@ async def reconcile_on_connect(device_id: str, live) -> None:
     Runs as a background task off the connect handler: nothing about the
     handshake should wait on a shell round trip over a link measured at 5-7%
     packet loss.
+
+    An emOS device's crash log is checked first and is NOT debounced: a device
+    that crashed and came back inside the window is exactly the one to look
+    at, and the on-device marker already makes a repeat check one round trip.
     """
+    if not live.android_userspace:
+        try:
+            await _collect_crash_log(live, device_id)
+        except Exception as e:
+            log.warning(f"[api] [{device_id}] crash log check failed ({e})")
     if not _reconcile_due(device_id, time.monotonic()):
         return
 
@@ -4701,13 +4866,197 @@ async def _fetch_latest_emos_release() -> Optional[dict]:
         tag = data.get("tag_name", "")
         if not tag.startswith("emos-v"):
             continue
-        asset = next(
-            (a for a in data.get("assets", []) if a.get("name") == "init"), None)
-        if asset is None:
+        assets = {a.get("name"): a for a in data.get("assets", [])}
+        # An `init` asset is still what makes a release selectable. That is the
+        # one every published release has carried, and requiring the newer
+        # `init32` instead would make every existing release invisible.
+        if "init" not in assets:
             continue
-        return {"version": tag, "url": asset["browser_download_url"],
-                "size": asset.get("size", 0)}
+        # Every asset by name. There are two inits — one per kernel
+        # architecture — so picking one here would be picking for the caller.
+        return {
+            "version": tag,
+            "assets": {n: {"url": a["browser_download_url"],
+                           "size": a.get("size", 0)}
+                       for n, a in assets.items() if n},
+        }
     return None
+
+
+# Which release asset carries the init for each kernel architecture. The init
+# must match the device's KERNEL — see em_emos_build's ARCH_* constants — and
+# these are the names emos-release.yml publishes.
+EMOS_INIT_ASSETS = {
+    em_emos_build.ARCH_ARM64: "init",
+    em_emos_build.ARCH_ARM: "init32",
+}
+
+# emOS's own userspace, installed into the image's /sbin. ONE build serves
+# both kernels — these are ordinary processes, and a 64-bit kernel runs 32-bit
+# binaries — so unlike the init there is nothing per-architecture here.
+#
+# busybox is here for the same reason the supplicant is: a FireOS 6 /system
+# ships toybox and no busybox at all, so without ours there is no udhcpc and
+# the image boots, associates, and never gets an address — plus no ntpd, no
+# syslogd/klogd, and no awk for em-wifi to read a scan with.
+#
+# This tuple is an allowlist and a payload missing any member is REFUSED, so
+# adding a name here strands every emOS release cut before it. Tag emOS first,
+# then the controller.
+EMOS_SBIN_ASSETS = ("wpa_supplicant", "wpa_cli", "em-wifi", "busybox")
+
+# One archive with a manifest of sha256s — see build_payload_bundle.
+EMOS_PAYLOAD_ASSET = "emos-payload.zip"
+
+
+async def _fetch_emos_payload(arch: str) -> tuple:
+    """Everything an emOS image needs for `arch`, from ONE release.
+
+    Returns (init, sbin, version, error) — `sbin` being the /sbin tools the
+    packer installs, and `error` a ready web.Response on failure and None on
+    success, so every caller refuses identically. They are entry points to one
+    question, and an answer that differed between them would be a bug nobody
+    would look for.
+
+    Comes from the release's bundle. A release predating it falls back to its
+    loose `init`, which is enough for FireOS 5 — so today's fleet keeps
+    provisioning with no new tag. FireOS 6 needs the bundle and says so.
+    """
+    release = await _fetch_latest_emos_release()
+    if release is None:
+        return None, {}, "", _error(
+            "no_emos_release",
+            "No published emOS release with an 'init' asset was found. Build "
+            "one from emos/ with build.sh and select it by hand, or cut an "
+            "emos-v* tag.", 404)
+
+    version = release["version"]
+    bundle_asset = release.get("assets", {}).get(EMOS_PAYLOAD_ASSET)
+
+    if bundle_asset is None:
+        # Older release: FireOS 5 is served by the loose init, FireOS 6 cannot be.
+        if arch != em_emos_build.ARCH_ARM64:
+            return None, {}, version, _error(
+                "no_payload_bundle",
+                f"emOS release {version} predates the payload bundle, so it "
+                f"carries no {arch} init and none of emOS's WiFi tools — a "
+                f"FireOS 6 image needs both. Cut a newer emos-v* tag.", 404)
+        init, version, err = await _fetch_one_init(release, arch)
+        return (None, {}, version, err) if err else (init, {}, version, None)
+
+    raw = await _fetch_binary(bundle_asset["url"],
+                              f"{version}-{EMOS_PAYLOAD_ASSET}")
+    if raw is None:
+        return None, {}, version, _error(
+            "fetch_failed",
+            f"Could not download {EMOS_PAYLOAD_ASSET} from GitHub", 502)
+
+    # Checked against the digests the release recorded. Loud, because a bad
+    # release is bad for everyone and the next move is a partition write.
+    try:
+        payload = await asyncio.get_event_loop().run_in_executor(
+            None, em_emos_build.read_payload_bundle, raw)
+    except em_emos_build.BuildError as e:
+        log.error(f"[api] emOS release {version} carries an unusable payload "
+                  f"bundle: {e}")
+        return None, {}, version, _error(
+            "bad_release_asset",
+            f"The payload in emOS release {version} is not usable: {e}", 502)
+
+    files = payload["files"]
+    init_name = EMOS_INIT_ASSETS.get(arch,
+                                     EMOS_INIT_ASSETS[em_emos_build.ARCH_ARM64])
+    init = files.get(init_name)
+    if init is None:
+        return None, {}, version, _error(
+            "no_init_for_arch",
+            f"emOS release {version} carries no '{init_name}', so there is no "
+            f"init for this device's {arch} kernel. Cut a newer emos-v* tag, or "
+            f"build one from emos/ with build.sh and select it by hand.", 404)
+
+    # The manifest proves the bytes arrived intact, not that they are the right
+    # kind of binary.
+    problems = em_emos_build.init_binary_problems(init, arch)
+    if problems:
+        log.error(f"[api] emOS release {version} carries an unusable "
+                  f"{init_name}: {'; '.join(problems)}")
+        return None, {}, version, _error(
+            "bad_release_asset",
+            f"The {init_name} in emOS release {version} is not usable: "
+            f"{'; '.join(problems)}", 502)
+
+    # 32-bit kernel only, i.e. FireOS 6. init prefers /sbin/wpa_supplicant the
+    # moment one exists, so including these in a FireOS 5 image would move the
+    # whole fleet off Amazon's working supplicant as a side effect. Same for
+    # wpa_cli, which init's reassociate nudge now prefers.
+    sbin = {}
+    if arch == em_emos_build.ARCH_ARM:
+        missing = [n for n in EMOS_SBIN_ASSETS if n not in files]
+        if missing:
+            # Fatal: Amazon's supplicant cannot run under emOS, so the image
+            # would have no WiFi and no way to report it but a cable.
+            return None, {}, version, _error(
+                "no_wifi_tools_for_arch",
+                f"emOS release {version} carries no {', '.join(missing)}. A "
+                f"FireOS 6 image needs emOS's own userspace — Amazon's "
+                f"supplicant cannot run under emOS and its /system has no "
+                f"busybox — so there is nothing to build a working image "
+                f"from. Cut a newer emos-v* tag.", 404)
+        sbin = {n: files[n] for n in EMOS_SBIN_ASSETS}
+
+    return init, sbin, version, None
+
+
+async def _fetch_emos_init(arch: str) -> tuple:
+    """Just the init, for the download endpoint: (binary, version, error)."""
+    release = await _fetch_latest_emos_release()
+    if release is None:
+        return None, "", _error(
+            "no_emos_release",
+            "No published emOS release with an 'init' asset was found. Build "
+            "one from emos/ with build.sh and select it by hand, or cut an "
+            "emos-v* tag.", 404)
+    return await _fetch_one_init(release, arch)
+
+
+async def _fetch_one_init(release: dict, arch: str) -> tuple:
+    """The init for `arch` out of an already-resolved release.
+
+    Validation happens HERE, against the architecture that was asked for, so a
+    release built wrong is refused at the point of download rather than at the
+    point of boot — and every route to an init goes through this one function.
+    """
+    name = EMOS_INIT_ASSETS.get(arch, EMOS_INIT_ASSETS[em_emos_build.ARCH_ARM64])
+    asset = release.get("assets", {}).get(name)
+    if asset is None:
+        # A release predating the second init, asked for the 32-bit one. Said
+        # plainly rather than falling back to the 64-bit asset, which would
+        # build an image that takes the flash and then produces no output at
+        # all — the failure this whole path exists to prevent.
+        return None, release["version"], _error(
+            "no_init_for_arch",
+            f"emOS release {release['version']} carries no '{name}' asset, so "
+            f"there is no init for this device's {arch} kernel. Cut a newer "
+            f"emos-v* tag, or build one from emos/ with build.sh and select it "
+            f"by hand.", 404)
+
+    binary = await _fetch_binary(asset["url"], f"{release['version']}-{name}")
+    if binary is None:
+        return None, release["version"], _error(
+            "fetch_failed", "Could not download the emOS init from GitHub", 502)
+
+    problems = em_emos_build.init_binary_problems(binary, arch)
+    if problems:
+        # A release that is wrong is worth saying so about loudly: it is wrong
+        # for everyone, not just this download.
+        log.error(f"[api] emOS release {release['version']} carries an unusable "
+                  f"{name}: {'; '.join(problems)}")
+        return None, release["version"], _error(
+            "bad_release_asset",
+            f"The {name} in emOS release {release['version']} is not usable: "
+            f"{'; '.join(problems)}", 502)
+
+    return binary, release["version"], None
 
 
 @auth.require_admin
@@ -4725,47 +5074,67 @@ async def _get_provision_emos_init(request: web.Request) -> web.Response:
     shipping one would mean redistributing Amazon's code; the image is
     assembled from the boot partition the user read off their own device.
 
-    Verified before it is served, not after it is flashed. The same two checks
-    the build applies, run here as well, so a release built wrong is refused
-    at the point of download rather than at the point of boot.
+    Verified before it is served, not after it is flashed. The same checks the
+    build applies, run here as well, so a release built wrong is refused at the
+    point of download rather than at the point of boot.
+
+    `?arch=arm|arm64` picks which init, because it must match the device's
+    KERNEL and the two FireOS versions differ. It DEFAULTS to arm64, which is
+    what this served when there was only one asset — so an older dashboard, or
+    anyone fetching the file by hand, keeps getting the FireOS 5 init.
+
+    A caller that holds the reference image should not use this at all: POST the
+    reference to `/api/provision/emos_image` with `use_latest_init` and let the
+    controller read the architecture off it. Passing an arch means the caller
+    decided, and the only thing that actually knows is the image.
     """
-    release = await _fetch_latest_emos_release()
-    if release is None:
+    arch = (request.query.get("arch") or em_emos_build.ARCH_ARM64).strip()
+    if arch not in EMOS_INIT_ASSETS:
         return _error(
-            "no_emos_release",
-            "No published emOS release with an 'init' asset was found. Build "
-            "one from emos/ with build.sh and select it by hand, or cut an "
-            "emos-v* tag.", 404)
+            "bad_arch",
+            f"Unknown architecture {arch!r} — expected one of "
+            f"{', '.join(sorted(EMOS_INIT_ASSETS))}.", 400)
 
-    binary = await _fetch_binary(release["url"], release["version"])
-    if binary is None:
-        return _error("fetch_failed",
-                      "Could not download the emOS init from GitHub", 502)
-
-    problems = em_emos_build.init_binary_problems(binary)
-    if problems:
-        # A release that is wrong is worth saying so about loudly: it is wrong
-        # for everyone, not just this download.
-        log.error(f"[api] emOS release {release['version']} carries an unusable "
-                  f"init: {'; '.join(problems)}")
-        return _error("bad_release_asset",
-                      f"The init in emOS release {release['version']} is not "
-                      f"usable: {'; '.join(problems)}", 502)
+    binary, version, err = await _fetch_emos_init(arch)
+    if err is not None:
+        return err
 
     return web.Response(
         body=binary,
         content_type="application/octet-stream",
         headers={
-            "Content-Disposition": 'attachment; filename="init"',
-            "X-Emos-Version": release["version"],
+            # Named for the asset that was served, so a downloaded file says
+            # which kernel it is for rather than every arch arriving as "init".
+            "Content-Disposition":
+                f'attachment; filename="{EMOS_INIT_ASSETS[arch]}"',
+            "X-Emos-Version": version,
+            "X-Emos-Arch": arch,
         },
     )
+
+
+# The multipart fields _post_provision_emos_image reads, and the only ones. A
+# field the wizard sends that is not named here is dropped without a word.
+#
+# That is how `system_part` went missing for the life of the feature (#545).
+# The wizard resolved it, logged which partition it had chosen, and appended
+# it; the loop below had no branch for it, so `parts` never carried it, the
+# validation that follows could not fire, and every v2 image was built with no
+# `emos.system=` stamp — while the release notes, the wizard transcript and
+# this file all said otherwise. emOS then fell back to its hardcoded p13, which
+# is the right partition about half the time.
+#
+# tests/test_emos_image_fields.py compares this against what dashboard.jsx
+# appends to the same POST, so the next field to be added has to be read here
+# or fail CI.
+EMOS_IMAGE_FIELDS = ("reference", "init", "reference_md5", "version",
+                     "use_latest_init", "system_part")
 
 
 @auth.require_admin
 async def _post_provision_emos_image(request: web.Request) -> web.Response:
     """
-    POST /api/provision/emos_image (multipart: "reference", "init", "version")
+    POST /api/provision/emos_image (multipart: EMOS_IMAGE_FIELDS)
 
     Build an emOS boot image from the reference the wizard just escrowed off
     the device, and stream it back. Step 5 of the emOS provisioning flow.
@@ -4782,10 +5151,11 @@ async def _post_provision_emos_image(request: web.Request) -> web.Response:
     and it is also the file we take care never to redistribute. Same reason
     the built image is streamed rather than cached.
 
-    The init binary rides in the request rather than being resolved here. That
-    is the first-cut shape and it is a known gap: the natural home is a
-    release asset beside `server`, so the wizard can offer "latest from
-    GitHub" the way it already does for the firmware.
+    `use_latest_init` resolves the init HERE, because the init must match the
+    reference's kernel and this is the only place holding the reference. A caller
+    choosing for itself would need a second copy of reference_kernel_arch.
+
+    An explicit `init` part still wins, for a hand-built binary.
     """
     try:
         reader = await request.multipart()
@@ -4794,13 +5164,26 @@ async def _post_provision_emos_image(request: web.Request) -> web.Response:
             field = await reader.next()
             if field is None:
                 break
+            if field.name not in EMOS_IMAGE_FIELDS:
+                # Loud, because the silent version of this cost every v2
+                # device its /system stamp.
+                log.warning(f"[api] emOS image: ignoring multipart field "
+                            f"{field.name!r}, which this endpoint does not "
+                            f"read")
+                continue
             if field.name in ("reference", "init"):
                 parts[field.name] = await field.read()
+            elif field.name == "system_part":
+                parts["system_part"] = (await field.read()).decode(
+                    errors="replace")[:8]
             elif field.name == "reference_md5":
                 parts["reference_md5"] = (await field.read()).decode(
                     errors="replace")[:64].strip().lower()
             elif field.name == "version":
                 parts["version"] = (await field.read()).decode(errors="replace")[:64]
+            elif field.name == "use_latest_init":
+                parts["use_latest_init"] = (await field.read()).decode(
+                    errors="replace")[:8].strip() not in ("", "0", "false")
 
         reference = parts.get("reference")
         init_bin = parts.get("init")
@@ -4808,10 +5191,11 @@ async def _post_provision_emos_image(request: web.Request) -> web.Response:
             return _error("invalid_upload",
                           "Expected multipart field 'reference' — the boot "
                           "image read off the device", 400)
-        if not init_bin:
+        if not init_bin and not parts.get("use_latest_init"):
             return _error("invalid_upload",
                           "Expected multipart field 'init' — the emOS init "
-                          "binary", 400)
+                          "binary — or 'use_latest_init' to resolve it here",
+                          400)
 
         # The escrow arrived intact, checked before anything reads it.
         #
@@ -4838,14 +5222,67 @@ async def _post_provision_emos_image(request: web.Request) -> web.Response:
                     f"Nothing has been built. Re-run the escrow step.", 400)
 
         version = parts.get("version") or "0.1"
+        # A hand-picked init carries no WiFi tools, matching emos/build.sh.
+        sbin = {}
+
+        # Which FireOS userspace this reference was read beside, stamped onto
+        # the image so emOS mounts that one rather than assuming. The WIZARD
+        # resolves it, because system_a/system_b are names and TWRP's by-name
+        # map is the only place those names exist — this end never guesses.
+        #
+        # Absent is allowed: an image with no stamp falls back to the partition
+        # emOS hardcoded before this existed, so an older wizard keeps working.
+        # A value we cannot read is refused rather than dropped, because
+        # silently omitting it builds an image that mounts the wrong userspace
+        # and boots.
+        system_part = None
+        raw_part = (parts.get("system_part") or "").strip()
+        if raw_part:
+            if not raw_part.isdigit() or not 1 <= int(raw_part) <= 127:
+                return _error(
+                    "bad_system_part",
+                    f"system_part must be an mmcblk0 partition number (1-127), "
+                    f"not {raw_part!r}. Nothing has been built.", 400)
+            system_part = int(raw_part)
+
+        # Also keeps ~3.5MB out of a request that has already hit HA ingress's
+        # 413 once (2026-09-06).
+        if parts.get("use_latest_init"):
+            arch = em_emos_build.reference_kernel_arch(reference)
+            if not arch:
+                # Refused, not defaulted: an init chosen by guess flashes fine
+                # and then produces no output at all.
+                return _error(
+                    "unknown_reference_arch",
+                    "Could not read the kernel architecture out of that boot "
+                    "image, so there is no way to tell which init it needs. "
+                    "Check the escrow is the whole boot image, or build an init "
+                    "from emos/ with build.sh and select it by hand.", 400)
+            init_bin, sbin, init_version, err = await _fetch_emos_payload(arch)
+            if err is not None:
+                return err
+            version = parts.get("version") or init_version
+            log.info(f"[api] emOS image: reference kernel is {arch}, using "
+                     f"{EMOS_INIT_ASSETS[arch]} from {init_version}"
+                     + (f" plus {', '.join(sorted(sbin))}" if sbin else ""))
+
         loop = asyncio.get_event_loop()
         # Off the event loop: gzipping a ramdisk and hashing two images blocks
         # it for long enough to matter, and devices are streaming audio
         # through this process while somebody provisions a new one.
         info = await loop.run_in_executor(
-            None, em_emos_build.build_emos_image, reference, init_bin, version)
+            None, em_emos_build.build_emos_image, reference, init_bin, version,
+            "", sbin, system_part)
 
-        log.info(f"[api] emOS image built: {info['size']:,} bytes "
+        log.info(f"[api] emOS image built"
+                 # Not "(older wizard)", which is one of three ways to get
+                 # here and was the wrong one when this line last mattered:
+                 # the v1 path sends no partition by design, and until #545
+                 # the handler dropped the one the wizard did send. State
+                 # what is true — no stamp — and leave the cause alone.
+                 + (f" for /system on p{system_part}" if system_part else
+                    " with no /system stamp")
+                 + f": {info['size']:,} bytes "
                  f"md5={info['md5'][:8]}… from a {info['reference_size']:,} "
                  f"byte reference (md5 {info['reference_md5'][:8]}…)")
 

@@ -98,6 +98,7 @@ COPY em_ble_health.py .
 COPY em_ble_proxy.py .
 COPY em_oww_assets.py  ./
 COPY em_oww_models.py .
+COPY em_oww_metadata.py .
 COPY em_oww_warmup.py .
 COPY em_arbiter.py .
 COPY em_button.py .
@@ -105,6 +106,7 @@ COPY em_tap_burst.py .
 COPY em_player.py .
 COPY em_config_sections.py .
 COPY em_console_pw.py .
+COPY em_crashlog.py .
 COPY em_emos_build.py .
 COPY em_recordings.py .
 COPY em_turnclock.py .

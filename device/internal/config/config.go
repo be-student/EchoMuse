@@ -229,11 +229,11 @@ func (d *Device) Apply(msg ConfigMessage) {
 	if msg.StartupVolume > 0 {
 		d.StartupVolume = msg.StartupVolume
 	}
-	if msg.AdcDigitalGain > 0 {
-		d.AdcDigitalGain = msg.AdcDigitalGain
+	if msg.AdcDigitalGain != nil {
+		d.AdcDigitalGain = *msg.AdcDigitalGain
 	}
-	if msg.AdcMicpga > 0 {
-		d.AdcMicpga = msg.AdcMicpga
+	if msg.AdcMicpga != nil {
+		d.AdcMicpga = *msg.AdcMicpga
 	}
 	if msg.MicGainDb != nil {
 		d.MicGainDb = clampMicGainDb(*msg.MicGainDb)
@@ -286,6 +286,8 @@ func (d *Device) Snapshot() ConfigMessage {
 		agcEnabled = *d.AgcEnabled
 	}
 	micGainDb := d.MicGainDb
+	adcDigitalGain := d.AdcDigitalGain
+	adcMicpga := d.AdcMicpga
 	aecEnabled := false
 	if d.AecEnabled != nil {
 		aecEnabled = *d.AecEnabled
@@ -305,8 +307,8 @@ func (d *Device) Snapshot() ConfigMessage {
 		BargeInEnabled:     &bargeInEnabled,
 		BargeInThreshold:   d.BargeInThreshold,
 		StartupVolume:      d.StartupVolume,
-		AdcDigitalGain:     d.AdcDigitalGain,
-		AdcMicpga:          d.AdcMicpga,
+		AdcDigitalGain:     &adcDigitalGain,
+		AdcMicpga:          &adcMicpga,
 		MicGainDb:          &micGainDb,
 		BeamAngle:          &beamAngle,
 		BeamformingEnabled: &beamformingEnabled,
@@ -324,8 +326,14 @@ func (d *Device) Snapshot() ConfigMessage {
 // sent by the controller. JSON tags must match em_controller.py exactly.
 type ConfigMessage struct {
 	Type               string   `json:"type,omitempty"`
-	AdcDigitalGain     int      `json:"adcDigitalGain,omitempty"`
-	AdcMicpga          int      `json:"adcMicpga,omitempty"`
+	// Pointer typed so 0 is expressible. Both are raw tinymix control
+	// values and 0 is the bottom of each control's own range — a legitimate
+	// setting, and the one somebody reaches for in a loud room. Under the
+	// "non-zero means set" rule they were silently ignored: the dashboard
+	// slider offers 0, the config stored 0, and the device carried on at
+	// whatever gain it already had.
+	AdcDigitalGain     *int     `json:"adcDigitalGain,omitempty"`
+	AdcMicpga          *int     `json:"adcMicpga,omitempty"`
 	MicGainDb          *int     `json:"micGainDb,omitempty"`
 	StartupVolume      int      `json:"startupVolume,omitempty"`
 	VadThreshold       float64  `json:"vadThreshold,omitempty"`
@@ -345,6 +353,19 @@ type ConfigMessage struct {
 	// firmware never checks it, because the console must work when the
 	// firmware is not running. Ignored on FireOS, which uses adbd.
 	ConsolePassword    *string  `json:"consolePassword,omitempty"`
+	// ConsoleTimeoutMin is the emOS console idle timeout in MINUTES: 0 for no
+	// timeout, otherwise 1-90. A POINTER for ConsolePassword's reason — zero
+	// is the legitimate "no timeout" setting, so with omitempty it would be
+	// indistinguishable from a field nobody sent and could never be turned
+	// off once on.
+	//
+	// Minutes because that is the unit it is chosen in. `TMOUT` is seconds;
+	// init multiplies when it builds the shell's environment, so the stored
+	// value, the pushed value and the number on screen all agree.
+	//
+	// Written to disk for init like the password above, and ignored on
+	// FireOS, which uses adbd.
+	ConsoleTimeoutMin  *int     `json:"consoleTimeoutMin,omitempty"`
 	BargeInEnabled     *bool    `json:"bargeInEnabled,omitempty"`
 	BargeInThreshold   float64  `json:"bargeInThreshold,omitempty"`
 	DuckDb             *float64 `json:"duckDb,omitempty"`

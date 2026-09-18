@@ -43,7 +43,11 @@ hear the answer through the Dot's speaker. The hardware you already own
   its own event instead, if you'd rather bind the tap. The hold keeps working
   with the mic muted, so a Dot muted for privacy is still a button.
 - **Headphones** — plug into the 3.5mm jack and audio moves there, unplug and
-  it comes back, no reboot needed.
+  it comes back, no reboot needed. Two known faults, both open: booting with a
+  plug already inserted is unreliable, and unplugging can stall the microphone
+  for around thirty seconds ([#117](https://github.com/wilbowes/EchoMuse/issues/117),
+  [#141](https://github.com/wilbowes/EchoMuse/issues/141)). Plugging in and out
+  of a running device works.
 - **Fleet dashboard** — provisioning wizard, per-device or global config
   pushed live (EQ, LED ring scenes, mic tuning), A/B-slot OTA updates with
   automatic fallback, root shell, logs, and per-turn activity analytics
@@ -92,6 +96,20 @@ the original SDK that made this hardware accessible.
 
 ## Before you start
 
+> **⚠️ Do not install amonet-biscuit v2.0.0 on an Echo you use with EchoMuse.**
+> Version 2.0.0 of the unlock (10 September 2026) replaces the Echo's
+> bootloaders, and after that FireOS 5 no longer boots. EchoMuse only runs on
+> FireOS 5, emOS included, because emOS uses the FireOS 5 kernel. The XDA
+> thread now tells unlocked users to update. If your Echo runs EchoMuse,
+> don't.
+>
+> - **Unlocking a new Echo?** Use **amonet-biscuit v1.1.0**, which is still
+>   attached to the XDA thread.
+> - **Already updated?** Do not try to go back by flashing FireOS 5 or an
+>   older amonet. v2.0.0 rewrote the preloader, LK and TrustZone, and writing
+>   old ones back by hand is how an Echo gets hard-bricked. EchoMuse does not
+>   run on FireOS 6 today, so for now that Echo stays on FireOS 6.
+
 **New here? Start with the [quickstart](docs/quickstart.md)** — it's the
 guided path from zero to talking to your Dot, and it sends you to the
 rooting guide at the right moment rather than opening with it.
@@ -104,7 +122,7 @@ of which is a
 walkthrough.
 
 The short version:
-- Persistent unlock via [amonet-biscuit](https://xdaforums.com/t/unlock-root-twrp-unbrick-amazon-echo-dot-2nd-gen-2016-biscuit.4761416/) (R0rt1z2)
+- Persistent unlock via [amonet-biscuit](https://xdaforums.com/t/unlock-root-twrp-unbrick-amazon-echo-dot-2nd-gen-2016-biscuit.4761416/) (R0rt1z2) — **v1.1.0, not v2.0.0** (see above)
 - FireOS 5 (Android 5.1, API 22)
 - Magisk 17.3
 - Alexa voice stack disabled (the dashboard's debloat step handles this)

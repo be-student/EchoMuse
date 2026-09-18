@@ -22,6 +22,7 @@ import (
 	"github.com/wilbowes/EchoMuse/internal/config"
 	"github.com/wilbowes/EchoMuse/internal/discovery"
 	"github.com/wilbowes/EchoMuse/internal/platform"
+	"github.com/wilbowes/EchoMuse/pkg/board"
 	"github.com/wilbowes/EchoMuse/pkg/buttons"
 	"github.com/wilbowes/EchoMuse/pkg/led"
 )
@@ -163,60 +164,207 @@ func (c *ControlClient) IsConnected() bool {
 
 var errPending = fmt.Errorf("pending approval")
 
+// maxStaticAttempts is how many consecutive dial failures one configured
+// endpoint gets before Run moves to the next target in the pass. 1 would
+// tour the whole list on a single transient blip — a brief drop on the
+// endpoint actually in front of the device costing a lap through every
+// backup before trying it again, which is slower than just retrying it.
+//
+// maxMDNSAttempts is the same idea for the bounded mDNS slot at the end of a
+// pass, and is deliberately 1, not maxStaticAttempts: the "don't abandon the
+// endpoint in front of you too eagerly" argument is about a specific
+// configured address, which mDNS has none of — a second browse immediately
+// after the first found nothing is not "retrying the endpoint you're at",
+// it's just a slower pass.
+const (
+	maxStaticAttempts = 2
+	maxMDNSAttempts   = 1
+)
+
+// staticBackoff is the per-attempt wait after a failed static pass, indexed
+// by how many full passes (every configured endpoint, then one bounded mDNS
+// try) have failed in a row. Modelled on how VoIP phones hunt for DHCP
+// options and a config server (settled design, #106): two fast passes so a
+// genuinely brief blip resolves quickly, then a widening backoff so a
+// controller that is really gone isn't hammered. Holds at the last value.
+//
+// Applied per attempt, not per pass, so the wall-clock time to tour the
+// whole list scales with how many endpoints are configured — a pass at the
+// 60s tier costs roughly (len(endpoints)+1)*60s, not a flat 60s. Chosen
+// deliberately over a per-pass wait: it keeps individual dials evenly
+// spaced regardless of backoff tier, and a static list is expected to stay
+// short (the design's own examples show two or three entries), where the
+// difference is seconds, not minutes. Reconsider this if a real deployment
+// configures a long list.
+var staticBackoff = []time.Duration{
+	5 * time.Second,
+	5 * time.Second,
+	10 * time.Second,
+	20 * time.Second,
+	60 * time.Second,
+}
+
+func staticRetryDelay(passNum int) time.Duration {
+	if passNum >= len(staticBackoff) {
+		return staticBackoff[len(staticBackoff)-1]
+	}
+	return staticBackoff[passNum]
+}
+
 func (c *ControlClient) Run(ctx context.Context, data *DataClient) error {
+	// Position within a configured static pass — a pass being every
+	// endpoint in order plus one bounded mDNS attempt, computed as passLen
+	// below. All three are in-memory only: losing them across a restart is
+	// harmless since the file is re-read every attempt anyway, and a fresh
+	// process restarting the pass from the top is the documented
+	// behaviour, not a bug.
+	targetIdx := 0
+	targetAttempts := 0
+	passNum := 0
+
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 
-		// Show orange pulse while searching for server
-		if c.disconnectedCallback != nil {
-			c.disconnectedCallback()
+		// Re-read every attempt, the same contract loadLinkCreds follows for
+		// the TLS credential files: a device stuck on a dead endpoint is
+		// exactly the one an operator cannot easily restart, so editing the
+		// file has to take effect on the very next reconnect, not at
+		// process start.
+		//
+		// A parse/validation error deliberately fails OPEN to mDNS below,
+		// same as an absent file: the overriding goal is that a device is
+		// never left unable to reach a controller, and that includes a typo
+		// in the config it cannot fix itself. This also applies to a pinned
+		// mdns:false fleet — a broken file there browses too. TLS
+		// verification bounds the blast radius (a browsed-to controller
+		// outside the fleet's CA is refused), so the failure mode is a
+		// delayed reconnect to the RIGHT controller, not a connection to
+		// the wrong one. Revisit if that stops being true.
+		static, staticErr := discovery.ConfiguredEndpoints()
+		if staticErr != nil {
+			log.Printf("[control] Static controller config invalid — using mDNS: %v", staticErr)
+		}
+		usingStatic := static != nil && len(static.Endpoints) > 0
+
+		// A pass is every configured endpoint in order, plus one bounded
+		// mDNS attempt at the end unless the config opts out — the settled
+		// resolution order from #106 is "configured list → mDNS, unless
+		// mdns:false", collapsed here since the persisted last-known tier
+		// is a separate, not-yet-built piece. Meaningless (0) when not
+		// usingStatic.
+		var passLen int
+		if usingStatic {
+			passLen = len(static.Endpoints)
+			if static.MDNS {
+				passLen++
+			}
 		}
 
-		// Fast path: try the last-known controller address before mDNS.
-		// Speeds up ordinary reconnects, and after a WiFi network change
-		// it's what makes a controller on a different subnet reachable at
-		// all (multicast rarely crosses subnets, so mDNS alone would fail
-		// the change's reconnect gate and revert a working network).
-		// The probe targets the plain port — it's a reachability check,
-		// not a plane choice; connect() re-decides ws vs wss every dial.
-		server := c.lastKnownServer()
-		if server != nil && server.TLSPort == 0 && loadLinkCreds().tlsConf != nil {
-			// CA installed but the cached endpoint predates the
-			// controller's TLS listener (e.g. controller upgraded, or a
-			// Secure-link push just landed, mid-run). One fresh browse so
-			// the tls_port TXT is picked up; keep the cached endpoint if
-			// mDNS fails — after a WiFi change the controller can sit on
-			// another subnet where multicast doesn't reach.
-			if found, err := discovery.FindServerOnce(ctx); err == nil && found != nil {
+		var server *discovery.ServerInfo
+		var dialErr error
+
+		if usingStatic {
+			if targetIdx >= passLen {
+				// A config edit mid-pass can shrink the list out from under
+				// an in-flight index — restart the pass rather than index
+				// out of range.
+				targetIdx, targetAttempts = 0, 0
+			}
+
+			if targetIdx == 0 && targetAttempts == 0 && c.disconnectedCallback != nil {
+				// Once per full pass, not once per target: otherwise the
+				// ring goes orange during every routine controller restart,
+				// which is one endpoint failing, not an outage.
+				c.disconnectedCallback()
+			}
+
+			if targetIdx < len(static.Endpoints) {
+				server = static.Endpoints[targetIdx]
+				log.Printf("[control] Static endpoint %d/%d (attempt %d/%d): %s",
+					targetIdx+1, passLen, targetAttempts+1, maxStaticAttempts, server.Addr)
+			} else {
+				// The list is exhausted for this pass: one bounded mDNS
+				// browse, never the indefinitely-retrying FindServer — that
+				// would park the device there and defeat the point of
+				// having somewhere to fall through TO. maxMDNSAttempts (not
+				// maxStaticAttempts) below is what keeps this to one try.
+				log.Printf("[control] Static list exhausted — one mDNS attempt (%d/%d)",
+					targetAttempts+1, maxMDNSAttempts)
+				found, err := discovery.FindServerOnce(ctx)
+				if err != nil || found == nil {
+					dialErr = fmt.Errorf("no controller found via mDNS this round")
+				} else {
+					server = found
+				}
+			}
+		} else {
+			if c.disconnectedCallback != nil {
+				c.disconnectedCallback()
+			}
+
+			// Fast path: try the last-known controller address before mDNS.
+			// Speeds up ordinary reconnects, and after a WiFi network change
+			// it's what makes a controller on a different subnet reachable at
+			// all (multicast rarely crosses subnets, so mDNS alone would fail
+			// the change's reconnect gate and revert a working network).
+			// The probe targets the plain port — it's a reachability check,
+			// not a plane choice; connect() re-decides ws vs wss every dial.
+			server = c.lastKnownServer()
+			if server != nil && server.TLSPort == 0 && loadLinkCreds().tlsConf != nil {
+				// CA installed but the cached endpoint predates the
+				// controller's TLS listener (e.g. controller upgraded, or a
+				// Secure-link push just landed, mid-run). One fresh browse so
+				// the tls_port TXT is picked up; keep the cached endpoint if
+				// mDNS fails — after a WiFi change the controller can sit on
+				// another subnet where multicast doesn't reach.
+				if found, err := discovery.FindServerOnce(ctx); err == nil && found != nil {
+					server = found
+				}
+			}
+			if server != nil && probeTCP(server.Addr, 3*time.Second) {
+				log.Printf("[control] Last-known controller %s reachable — skipping mDNS", server.Addr)
+			} else {
+				found, err := discovery.FindServer(ctx)
+				if err != nil {
+					return err
+				}
 				server = found
 			}
 		}
-		if server != nil && probeTCP(server.Addr, 3*time.Second) {
-			log.Printf("[control] Last-known controller %s reachable — skipping mDNS", server.Addr)
+
+		var err error
+		var healthy bool
+		if server != nil {
+			dataCtx, cancelData := context.WithCancel(ctx)
+			go func() {
+				if err := data.Run(dataCtx); err != nil && err != context.Canceled {
+					log.Printf("[data] stopped: %v", err)
+				}
+			}()
+
+			healthy, err = c.connect(ctx, server, data)
+
+			cancelData()
 		} else {
-			found, err := discovery.FindServer(ctx)
-			if err != nil {
-				return err
-			}
-			server = found
+			// The bounded mDNS slot came up empty this round — no server to
+			// dial, so treat it exactly like any other failed target rather
+			// than special-casing "nothing to try." healthy stays false: no
+			// connection was even attempted.
+			err = dialErr
 		}
-
-		dataCtx, cancelData := context.WithCancel(ctx)
-		go func() {
-			if err := data.Run(dataCtx); err != nil && err != context.Canceled {
-				log.Printf("[data] stopped: %v", err)
-			}
-		}()
-
-		err := c.connect(ctx, server, data)
-
-		cancelData()
 
 		switch err {
 		case errPending:
 			log.Printf("[control] Device pending approval — retrying in 30s")
+			if usingStatic {
+				// The endpoint answered, and registration itself worked —
+				// pending-approval is success for discovery purposes.
+				// Falling through here would send a device waiting for its
+				// own approval off hunting for a different controller.
+				targetAttempts, passNum = 0, 0
+			}
 			if c.pendingCallback != nil {
 				c.pendingCallback()
 			}
@@ -226,22 +374,74 @@ func (c *ControlClient) Run(ctx context.Context, data *DataClient) error {
 			case <-time.After(30 * time.Second):
 			}
 		default:
-			if err != nil {
-				log.Printf("[control] Connection lost: %v — reconnecting in 5s", err)
+			if usingStatic {
+				if healthy {
+					// A connection that lasted staticHealthyDuration is a
+					// real recovery rather than a connect-then-drop flap, so
+					// restart the pass at the top and reset the backoff.
+					// Without this the device drifts down the list and never
+					// climbs back to its preferred endpoint.
+					//
+					// Test healthy, not err == nil: connect's read loop
+					// always exits with an error, so err == nil never fires.
+					targetIdx, targetAttempts, passNum = 0, 0, 0
+				} else {
+					targetAttempts++
+					maxAttempts := maxStaticAttempts
+					if targetIdx == len(static.Endpoints) {
+						maxAttempts = maxMDNSAttempts
+					}
+					if targetAttempts >= maxAttempts {
+						targetAttempts = 0
+						targetIdx++
+						if targetIdx >= passLen {
+							targetIdx = 0
+							passNum++
+						}
+					}
+				}
 			}
-			if c.disconnectedCallback != nil {
+
+			wait := 5 * time.Second
+			if usingStatic {
+				wait = staticRetryDelay(passNum)
+			}
+			if err != nil {
+				log.Printf("[control] Connection lost: %v — reconnecting in %s", err, wait)
+			}
+			if !usingStatic && c.disconnectedCallback != nil {
+				// The static path already showed this once at the top of
+				// the pass; re-showing it here on every single target would
+				// reintroduce the per-endpoint flashing the pass-level check
+				// above exists to avoid.
 				c.disconnectedCallback()
 			}
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(5 * time.Second):
+			case <-time.After(wait):
 			}
 		}
 	}
 }
 
-func (c *ControlClient) connect(ctx context.Context, server *discovery.ServerInfo, data *DataClient) error {
+// staticHealthyDuration is how long a connection has to stay up before Run
+// treats it as a genuine recovery rather than a connect-then-drop flap. Set
+// comfortably above one keepalive round trip (wsPingInterval, 20s) so a
+// connection that resets the pass/backoff state has actually proven itself,
+// not just completed a handshake before dying again.
+const staticHealthyDuration = 30 * time.Second
+
+// connect dials server and runs the control-plane read loop until it exits.
+// The bool return reports whether the connection stayed up at least
+// staticHealthyDuration before that happened — false at every early return
+// (a dial failure, a registration error, errPending: nothing before
+// c.connectedCallback fires counts as "connected" yet), computed for real
+// only at the read loop's exit, the one place a healthy connection can
+// still end up back here.
+func (c *ControlClient) connect(ctx context.Context, server *discovery.ServerInfo, data *DataClient) (bool, error) {
+	var connectedAt time.Time
+
 	// Credentials are re-read on every dial: a "Secure link" push from the
 	// controller lands mid-run, and the very next reconnect should pick it
 	// up without a restart.
@@ -263,7 +463,7 @@ func (c *ControlClient) connect(ctx context.Context, server *discovery.ServerInf
 	dialer := creds.dialer()
 	conn, _, err := dialer.DialContext(ctx, baseURL+"/control", creds.header())
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer conn.Close()
 
@@ -311,6 +511,9 @@ func (c *ControlClient) connect(ctx context.Context, server *discovery.ServerInf
 		// before the network is up, exactly like ambient_light_status above —
 		// nothing about it needs re-reporting every 30 seconds.
 		"base_os": platform.Base(),
+		// Which board detection matched (pkg/board), "unknown" when none did.
+		// Unread by current controllers, so safe to add unnegotiated.
+		"board": board.IDOf(board.Detect("")),
 	}
 	// Resolved fresh per registration: a cached-at-startup value goes stale
 	// after a WiFi change, and if the process started while the network was
@@ -324,19 +527,19 @@ func (c *ControlClient) connect(ctx context.Context, server *discovery.ServerInf
 	// Send register BEFORE publishing conn — prevents concurrent SendButton /
 	// SendMuteState from racing this write on the same gorilla conn.
 	if err := conn.WriteMessage(websocket.TextMessage, regBytes); err != nil {
-		return err
+		return false, err
 	}
 
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	var first controlMessage
 	if err := conn.ReadJSON(&first); err != nil {
-		return err
+		return false, err
 	}
 	conn.SetReadDeadline(time.Time{})
 
 	switch first.Type {
 	case "pending":
-		return errPending
+		return false, errPending
 	case "ack":
 		// The controller tells us what IT can do here. Recorded before conn
 		// is published, so a caller reading it can never see a stale set
@@ -361,7 +564,7 @@ func (c *ControlClient) connect(ctx context.Context, server *discovery.ServerInf
 			}
 		}
 	default:
-		return fmt.Errorf("unexpected first message: %s", first.Type)
+		return false, fmt.Errorf("unexpected first message: %s", first.Type)
 	}
 
 	log.Printf("[control] Registered as %s (version %s)", c.deviceID, Version)
@@ -383,6 +586,7 @@ func (c *ControlClient) connect(ctx context.Context, server *discovery.ServerInf
 	if c.connectedCallback != nil {
 		c.connectedCallback()
 	}
+	connectedAt = time.Now()
 	data.NotifyReady(baseURL)
 
 	// Keepalive — same mechanism as the data client (see wsPingInterval in
@@ -421,7 +625,7 @@ func (c *ControlClient) connect(ctx context.Context, server *discovery.ServerInf
 	for {
 		var raw json.RawMessage
 		if err := conn.ReadJSON(&raw); err != nil {
-			return err
+			return time.Since(connectedAt) >= staticHealthyDuration, err
 		}
 		conn.SetReadDeadline(time.Now().Add(wsPongWait))
 
@@ -513,6 +717,21 @@ func (c *ControlClient) connect(ctx context.Context, server *discovery.ServerInf
 					} else if changed {
 						log.Printf("[control] Console password %s",
 							map[bool]string{true: "set", false: "cleared"}[*msg.ConsolePassword != ""])
+					}
+				}
+				// Same shape and the same reasons: a pointer so zero can
+				// mean "no timeout" rather than "not mentioned", written to
+				// disk for init, never acted on here.
+				if msg.ConsoleTimeoutMin != nil {
+					changed, err := config.WriteConsoleTimeout(*msg.ConsoleTimeoutMin)
+					if err != nil {
+						log.Printf("[control] Console timeout: %v", err)
+					} else if changed {
+						if *msg.ConsoleTimeoutMin == 0 {
+							log.Printf("[control] Console timeout cleared")
+						} else {
+							log.Printf("[control] Console timeout %dm", *msg.ConsoleTimeoutMin)
+						}
 					}
 				}
 				snap := cfg.Snapshot() // read back under the config lock
@@ -1074,38 +1293,107 @@ func probeTCP(addr string, timeout time.Duration) bool {
 	return true
 }
 
-// GetSerialNo reads ro.serialno — stable device identifier matching adb devices output.
+// idmePath is Amazon's ID Manager, exported by their kernel driver. It holds
+// this unit's factory identity — serial, board_id, MAC addresses, per-unit ALS
+// and microphone calibration — and the files are world-readable.
 //
-// Falls back to androidboot.serialno on the kernel command line, which is where
-// the value comes from in the first place. The two sources are complementary
-// rather than redundant: Android's init consumes every androidboot.* argument
-// into a property and strips it from /proc/cmdline, so on stock FireOS only
-// getprop answers — while on a device booted without Android's userspace there
-// is no property service and only the cmdline answers. Both yield the identical
-// string, which matters because the whole fleet is keyed on the serial.
+// A variable so tests can point it elsewhere.
+var idmePath = "/proc/idme/serial"
+
+// GetSerialNo returns this unit's serial. The whole fleet is keyed on it, so a
+// wrong or missing answer is not cosmetic: every device that cannot resolve one
+// registers as "unknown-device" and they collide with each other.
+//
+// Three sources, in descending order of how much has to be working for them to
+// answer:
+//
+//  1. /proc/idme/serial — the hardware value, straight from Amazon's kernel
+//     driver. No property service, no bootloader argument, and it answers
+//     identically under FireOS, emOS and TWRP. Verified 2026-09-15 on a v1
+//     (FireOS 5, matching getprop exactly) and a v2 (FireOS 6, in recovery).
+//  2. getprop ro.serialno — needs Android's property service, so FireOS only.
+//  3. androidboot.serialno on the kernel command line, where the property came
+//     from — needs Android's init NOT to have run, since it consumes every
+//     androidboot.* argument and strips it from /proc/cmdline.
+//
+// idme leads because the cmdline is not reliably there to be read. On FireOS 6
+// the kernel is 32-bit, COMMAND_LINE_SIZE is 1024, and emOS's own cmdline is
+// 385 bytes against stock's 70 — which pushes androidboot.serialno, near the
+// end of what LK appends, to byte 1040. It is truncated away before the kernel
+// ever sees it, and both this and emOS's init then correctly find nothing.
+// Measured on the spare, 2026-09-15.
 func GetSerialNo() string {
+	if serial := serialFromIdme(); serial != "" {
+		return serial
+	}
 	out, err := exec.Command("getprop", "ro.serialno").Output()
 	if err == nil {
-		if serial := strings.TrimSpace(string(out)); serial != "" {
+		if serial := sanitiseSerial(string(out)); serial != "" {
 			return serial
 		}
 	}
+	// Last resort, and the only source that can be WRONG rather than absent.
+	// The kernel truncates at COMMAND_LINE_SIZE wherever it lands, so a cut
+	// mid-value leaves a short but well-formed serial — and it cannot be told
+	// apart from a real one, because procfs appends a newline either way and a
+	// serial legitimately last on the line looks identical. Hence the log line:
+	// the fallback being used at all is the thing worth seeing, since every
+	// device with an idme node should never reach here.
 	if serial := serialFromCmdline(); serial != "" {
+		log.Printf("[control] Serial came from the kernel cmdline, not idme — "+
+			"%q may be truncated; check /proc/idme/serial", serial)
 		return serial
 	}
-	log.Printf("[control] Warning: could not read ro.serialno: %v", err)
+	log.Printf("[control] Warning: no serial from idme, getprop or cmdline: %v", err)
 	return "unknown-device"
 }
 
+func serialFromIdme() string {
+	// Not cached, for the reason als.resolve() documents: this is first asked
+	// at registration, moments after boot, and a negative answer frozen there
+	// would outlive the condition that caused it.
+	b, err := os.ReadFile(idmePath)
+	if err != nil {
+		return ""
+	}
+	return sanitiseSerial(string(b))
+}
+
+// sanitiseSerial trims and validates a serial read from a device file.
+//
+// procfs hands back a value with no trailing newline, other sources add one,
+// and a partially written or absent field can read as NULs. Anything that is
+// not printable ASCII is rejected outright rather than passed on: a serial is
+// an identifier the controller stores, logs and keys rows on, and a plausible
+// but corrupt one is worse than none, since "unknown-device" at least says so.
+func sanitiseSerial(raw string) string {
+	if i := strings.IndexByte(raw, 0); i >= 0 {
+		raw = raw[:i]
+	}
+	s := strings.TrimSpace(raw)
+	if s == "" || len(s) > 64 {
+		return ""
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x21 || s[i] > 0x7e {
+			return ""
+		}
+	}
+	return s
+}
+
+// A variable so tests can point it elsewhere, like idmePath.
+var cmdlinePath = "/proc/cmdline"
+
 func serialFromCmdline() string {
-	b, err := os.ReadFile("/proc/cmdline")
+	b, err := os.ReadFile(cmdlinePath)
 	if err != nil {
 		return ""
 	}
 	const key = "androidboot.serialno="
 	for _, field := range strings.Fields(string(b)) {
 		if strings.HasPrefix(field, key) {
-			return strings.TrimPrefix(field, key)
+			return sanitiseSerial(strings.TrimPrefix(field, key))
 		}
 	}
 	return ""

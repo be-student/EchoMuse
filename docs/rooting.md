@@ -3,6 +3,31 @@
 > **You do this at your own risk. We accept no responsibility for negative
 > outcomes experienced.**
 
+> **⚠️ Don't install amonet-biscuit v2.0.0 on an Echo that is already running
+> EchoMuse on FireOS 5.** Version 2.0.0 of the unlock (10 September 2026)
+> replaces the Echo's bootloaders, and after that FireOS 5 no longer boots — so
+> a working FireOS 5 device would stop working, and there is no safe way back.
+> The XDA thread now tells unlocked users to update. If your Echo runs EchoMuse
+> on FireOS 5, don't.
+>
+> - **Unlocking a new Echo?** Use **amonet-biscuit v1.1.0**, which is still
+>   attached to the XDA thread. It is the path this project has the most
+>   hardware hours on by a wide margin.
+> - **Already updated to v2.0.0?** **Do not try to go back** by flashing
+>   FireOS 5 or an older amonet. v2.0.0 rewrote the preloader, LK and
+>   TrustZone, and writing old ones back by hand is how an Echo gets
+>   hard-bricked. Your Echo stays on FireOS 6 — and that is no longer a dead
+>   end: **emOS runs on FireOS 6's kernel** (first booted on hardware
+>   12 September 2026), so use the wizard's **emOS flow**, which accepts a v2
+>   device. The FireOS flow cannot work there and will refuse, because it boots
+>   the device's own Android 5.
+>
+>   Two honest caveats on that, because this is your hardware and it is new:
+>   it has been booted on **one** Echo so far, and **no Echo unlocked with
+>   v2.0.0 has been through the wizard end to end yet**. The wizard's Escrow
+>   Boot Image step is the way back from a bad flash — keep that file
+>   somewhere other than the device.
+
 EchoMuse needs an Echo Dot Gen 2 that is already unlocked and running
 FireOS 5. Two separate jobs get you there, and they carry very different
 risk.
@@ -16,23 +41,30 @@ risk.
 - OS: FireOS 5 (Android 5.1, API 22) — see the note below on FireOS 6
 - MicroUSB cable required
 
-> **FireOS 6 exists for biscuit and cannot be booted once you have unlocked.**
-> `Fire OS 6.5.7.0 (NS6570/6077)` is real, and amonet's instructions tell you
-> to update *to* it before unlocking, because the exploit downgrades the
-> firmware partitions on the way through. But after unlocking, only FireOS 5
-> based ROMs boot — R0rt1z2's thread is explicit that flashing FireOS 6 "may
-> result in a (soft) brick".
+> **Which FireOS boots depends on which amonet you used.** Up to v1.1.0, only
+> FireOS 5 based ROMs boot after unlocking; R0rt1z2's thread said flashing
+> FireOS 6 "may result in a (soft) brick". v2.0.0 (10 September 2026) turns
+> that round: it boots FireOS 6, and FireOS 5 no longer boots.
 >
-> Two reasons, and the second is the real one. FireOS 6 on this board is a
-> **32-bit** kernel while amonet's payload forced 64-bit — since fixed
-> upstream, by parsing the cmdline. The blocker underneath is the signature
-> chain: FireOS 6 likely needs a newer TrustZone, and a newer TZ cannot be
-> flashed because the FireOS 5 preloader refuses to boot one whose signature
-> differs. That is below the boundary this project writes to, so it is not
-> something EchoMuse can address.
+> What changes is the bootloaders, not the kernel's bitness. The v2.0.0
+> installer writes a newer preloader, LK and TrustZone to the device, and
+> FireOS 5's kernel does not run on them. Its LK patch starts a 32-bit or
+> 64-bit kernel according to what the boot image asks for, so bitness was not
+> the obstacle. (This corrects an earlier version of this note, which put it
+> down to the TrustZone signature chain.)
 >
-> Practically: EchoMuse targets FireOS 5, and a newer Android is not a route
-> to a newer kernel on this device.
+> **The firmware runs on FireOS 5; emOS runs on both.** EchoMuse's own
+> firmware targets the Android userspace, which is 32-bit on either FireOS, so
+> the binary is the same. What differs is emOS's init, which has to match the
+> kernel — 64-bit on FireOS 5, 32-bit on FireOS 6 — and the wizard picks that
+> by reading the architecture out of your own escrowed boot image rather than
+> asking you.
+>
+> The FireOS flow needs **v1.1.0**, since it boots the device's own Android 5.
+> For that
+> version, `Fire OS 6.5.7.0 (NS6570/6077)` still matters: its instructions
+> tell you to update *to* it before unlocking, because the exploit downgrades
+> the firmware partitions on the way through.
 
 ## What you need
 
@@ -41,7 +73,9 @@ For the unlock itself (R0rt1z2's thread has the authoritative list):
 - **Linux machine** with ADB and fastboot installed — see the note below on macOS
 - Python 3 (for boot image patching and Magisk DB creation)
 - The following files downloaded and ready:
-  - `amonet-biscuit-v1.1.0.zip` — from R0rt1z2's XDA thread
+  - `amonet-biscuit-v1.1.0.zip` — from R0rt1z2's XDA thread. **Not
+    v2.0.0**, which is what the thread now offers first; see the warning at
+    the top of this page.
   - `update-kindle-csm_biscuit-272.6.8.0_user_680767620.bin` — FireOS 5 firmware
     (**this exact build** — see below)
   - `f1r30s.zip` — from R0rt1z2's XDA thread. Does four things, not one:
@@ -93,7 +127,9 @@ The persistent unlock, the bootrom exploit and TWRP for this device are
 
 Follow that thread, not this page. We link to it rather than copying it
 because a copy goes out of date without anyone noticing. If the two ever
-disagree, the thread is correct.
+disagree, the thread is correct, **with one exception: the version.** Use
+v1.1.0, not v2.0.0. v2.0.0 stops FireOS 5 booting, and EchoMuse needs
+FireOS 5; see the warning at the top of this page.
 
 **This is the part that can ruin a device.** It runs a bootrom exploit,
 modifies the partition table and wipes userdata. A failure here can leave a
@@ -113,9 +149,34 @@ Once those are done, EchoMuse takes over. The provisioning wizard in the
 dashboard handles the rest — see the [Quickstart](quickstart.md). It starts
 from a device already in that state; it does not run the exploit.
 
-The steps the wizard performs (the SELinux patch, Magisk, and the root-grant
-database) happen with TWRP already installed, so a failure can usually be
-re-flashed from recovery.
+### The wizard has two flows, and they write different things
+
+**This matters before you start, because they are not equally reversible.**
+
+- **emOS** — the current default. Nine steps, all inside TWRP. It escrows your
+  boot partition and hands you the file, then replaces that partition with an
+  image built from your own kernel and device trees plus our init. The result
+  runs no Amazon userspace at all. See [`emos/README.md`](../emos/README.md).
+- **FireOS** — thirteen steps, chosen on the wizard's first step (or by
+  adding `?flow=fireos` to the dashboard URL).
+  Keeps Android and adds root: the SELinux cmdline patch, Magisk, and the
+  root-grant database. This is the path every device in the field took.
+
+Both leave a failed step with the device still in TWRP and say so. The
+difference that matters afterwards:
+
+**A device on emOS cannot be re-provisioned by the wizard, and going back
+wipes it.** emOS runs no adbd — it cannot, since adbd needs Android's property
+service — so the wizard's first step finds no device to talk to. Returning to
+FireOS means booting TWRP by hand, wiping cache and data, sideloading the
+FireOS 5 image and then flashing `f1r30s.zip`. That erases `/data`, taking
+EchoMuse, its configuration and its credentials with it. **`f1r30s.zip` is not
+optional** — a stock flash restores dm-verity against a partition table the
+unlock modified, and without it the device does not boot.
+
+Keep the escrowed boot image the emOS flow hands you at step 3. Writing it back
+takes about ten seconds, leaves `/data` alone, and is the undo for everything
+below.
 
 ## What EchoMuse writes, and what it does not
 
@@ -131,9 +192,12 @@ ever writes the FireOS one. Lowest first:
 | FireOS kernel and ramdisk | `mmcblk0p10` / `p11`. | **Yes**, one write |
 | `/system`, `/data` | FireOS userspace. | Yes, files only |
 
-The single partition write is in the wizard's Patch Boot Image step, and it
-puts the SELinux permissive cmdline and the `service echomuse` init entry into
-the FireOS kernel. TWRP presents that partition as `/dev/block/other-boot`.
+There is a single partition write either way, and TWRP presents that partition
+as `/dev/block/other-boot`. What goes into it differs by flow: the **FireOS**
+flow's Patch Boot Image step adds the SELinux permissive cmdline and the
+`service echomuse` init entry to the kernel already there, while the **emOS**
+flow replaces the partition with an image rebuilt from that same kernel and
+device trees. Neither touches any layer above `No` in the table.
 
 **The by-name directory means different things in TWRP and in Android**, which
 is worth knowing before reading any of it as gospel. Measured on hardware:
@@ -178,15 +242,73 @@ situation into the second.
 
 ## How well tested is this?
 
-Eight devices have been through the wizard's steps without a failure. That is
-a small sample, all of it on the same model by the same person, so treat it
-as encouraging rather than conclusive.
+**The two flows have very different amounts of evidence behind them, and the
+default is the newer one.**
+
+Eight devices have been through the **FireOS** flow's steps without a failure.
+That is a small sample, all of it on the same model by the same person, so
+treat it as encouraging rather than conclusive.
+
+The **emOS** flow has completed end to end on hardware, but only recently and
+on a handful of devices. Its first full run against a device restored to
+genuine stock failed at four separate steps before it worked — all four were
+faults in the wizard's own checks rather than in the writes, and all four are
+fixed, but that is the maturity to price in. If you want the better-evidenced
+path today, pick FireOS on the wizard's first step.
 
 ## Recovery
 
-If one of the wizard's steps fails, the device should still boot to TWRP —
-reboot to recovery and re-flash the affected component. If it will not reach
-TWRP at all, that is the unlock's territory and R0rt1z2's thread covers
+**The rule that matters: if a device will not boot, do not keep power cycling
+it.** Repeatedly power cycling one that will not come up is what turns a
+device recoverable from a cable into one that needs the case opened and a pin
+shorted. Go to TWRP instead — it is one button combo away and it costs about
+ten seconds to put the old boot image back.
+
+**Reaching TWRP on a device that will not boot:**
+
+1. Unplug the power.
+2. Hold the **mute** button down, and keep holding it.
+3. Apply power with the button still held.
+4. Wait for the ring to show an **alternating cyan pattern** — that is the
+   confirmation you are in recovery, and you can let go once you see it.
+
+`adb reboot recovery` is the easy route and it needs a device that is already
+up, which is exactly what you do not have here.
+
+### If a wizard step failed
+
+The device is still in TWRP and the wizard says so. Reconnect and use
+**Restore escrowed boot image** — it writes back the image read off your own
+device at the escrow step, verifies it against the partition, and leaves
+`/data` untouched. If you have reloaded the page since, choose the
+`echomuse-stock-boot-*.img` file you downloaded at that step; it is the same
+bytes.
+
+### If the first boot after flashing emOS does not come up
+
+The light ring says which case you are in:
+
+| Ring | What it means | What to do |
+|---|---|---|
+| Filling, then white, then fading | Up and on the network | Nothing — done, about 30 seconds |
+| Two lit segments at the top, throbbing | Waiting for the network | Nothing — this is most of the boot |
+| Solid amber | emOS is restoring its own last known-good image | **Leave it.** It reboots itself |
+| Red, stopped | A boot stage failed | Recoverable — go to TWRP and restore |
+| One segment orbiting a full blue ring, for more than a minute | emOS never started | Go to TWRP and restore |
+
+The last row is the only one that needs you. It means the kernel came up and
+our init never ran, so nothing on the device is going to fix itself — the
+orbit is the kernel's own boot animation, still running because userspace
+never claimed the ring.
+
+The amber row is worth knowing about precisely so you *do not* intervene:
+emOS counts boots that never reached the network and, after three, puts its
+own known-good image back and reboots. Interrupting that is the one way to
+make it worse.
+
+### If it will not reach TWRP either
+
+That is the unlock's territory rather than ours, and R0rt1z2's thread covers
 recovery and unbricking.
 
 ## Credits
@@ -210,9 +332,11 @@ This is the step that isn't documented anywhere else.
 
 The Little Kernel (LK) bootloader hardcodes `androidboot.selinux=enforce` into the kernel command line — this is set before Android even loads, and it's what blocks every attempt to disable SELinux at runtime. You cannot `setenforce 0` as shell, you cannot `resetprop`, you cannot use `magiskpolicy`. The kernel won't let you.
 
-The fix: we append `androidboot.selinux=permissive` to the boot image's own cmdline field. When both values are present in the kernel cmdline, permissive mode wins in practice on this device.
+The fix: we append `androidboot.selinux=permissive` to the boot image's own cmdline field. LK splices that field into the middle of its own parameters and adds its `enforce` afterwards, so both values end up on the kernel command line with ours first — and **the first one wins**. `androidboot.*` becomes a `ro.boot.*` property through Android's init, read-only properties are write-once, and the second set is refused. Measured on two devices, 2026-09-06: `getenforce` Permissive, `ro.boot.selinux` permissive.
 
-> **Note:** The `androidboot.selinux` value is a null-terminated ASCII string stored at a fixed offset (byte 64) in the Android boot image header, in a 512-byte field. We patch it directly rather than using magiskboot, which doesn't support cmdline modification on this version.
+Do not reason about this as a kernel parameter, where a later value would override an earlier one. `androidboot.selinux` is not one — the kernel's own switches are `selinux=` and `enforcing=`, which nothing here sets.
+
+> **Note:** The cmdline is a null-terminated ASCII string in a 512-byte field at a fixed offset (byte 64) of the Android boot image header. We patch it directly rather than using magiskboot, which doesn't support cmdline modification on this version.
 
 ### From TWRP, extract magiskboot and pull the boot image:
 
@@ -226,28 +350,52 @@ adb pull /tmp/work/boot.img boot_fresh.img
 
 ### Patch the cmdline on your host machine:
 
+This **appends** to what FireOS already put there. An earlier version of these
+instructions zeroed the whole 512-byte field and wrote a short replacement,
+which silently discarded FireOS's own arguments — `rootwait`, `ro`,
+`init=/init`, `buildvariant`, the `lowmemorykiller` tuning and `veritykeyid`.
+Devices booted anyway, because LK supplies `root=` and `androidboot.hardware`
+and kernel defaults covered the rest, so it went unnoticed for a long time. It
+is still the wrong thing to do to somebody's boot image.
+
 ```python
 python3 - <<'EOF'
+ARG = b'androidboot.selinux=permissive'
+START, END = 64, 576          # the 512-byte cmdline field
+
 with open('boot_fresh.img', 'rb') as f:
     data = bytearray(f.read())
 
-cmdline_offset = 64
-new_cmdline = b'bootopt=64S3,32N2,64N2 androidboot.selinux=permissive'
+if bytes(data[:8]) != b'ANDROID!':
+    raise SystemExit("Not an Android boot image — refusing to patch.")
 
-# Zero the full 512-byte field, then write new cmdline
-data[cmdline_offset:cmdline_offset+512] = b'\x00' * 512
-data[cmdline_offset:cmdline_offset+len(new_cmdline)] = new_cmdline
+field = data[START:END]
+used  = field.index(0) if 0 in field else len(field)
+existing = bytes(field[:used])
+print("Old cmdline:", existing.decode(errors='replace'))
 
-# Verify
-print("New cmdline:", data[cmdline_offset:cmdline_offset+60])
+if ARG in existing.split():
+    print("Already patched — nothing to do.")
+elif any(a.startswith(b'androidboot.selinux=') for a in existing.split()):
+    raise SystemExit(
+        "This image already sets androidboot.selinux to something else. "
+        "Appending would lose to it, because the FIRST value wins. Fix that "
+        "value rather than adding a second one.")
+else:
+    addition = (b' ' if used else b'') + ARG
+    if used + len(addition) >= len(field):      # keep room for the terminator
+        raise SystemExit("Cmdline too long to append without truncating it.")
+    data[START + used:START + used + len(addition)] = addition
+    data[START + used + len(addition)] = 0
+    print("New cmdline:", bytes(data[START:START + used + len(addition)]).decode())
 
-with open('boot_patched.img', 'wb') as f:
-    f.write(data)
-print("Written to boot_patched.img")
+    with open('boot_patched.img', 'wb') as f:
+        f.write(data)
+    print("Written to boot_patched.img")
 EOF
 ```
 
-Verify the output shows your new cmdline cleanly — no garbage bytes after `permissive`.
+Check that the new cmdline is your original one with `androidboot.selinux=permissive` on the end, and nothing missing from the front.
 
 ### Flash the patched image:
 

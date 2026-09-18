@@ -5,21 +5,43 @@ EchoMuse with **no Amazon userspace at all** — no Android init, no
 `system_server`, no `mediaserver`, no audio HAL.
 
 It is a distribution in the ordinary sense: it does not include a kernel of its
-own. It pairs the device's existing MediaTek 3.18 kernel with our own PID 1,
-busybox, and bionic and tinyalsa mounted read-only from the device's `/system`.
+own. It pairs the device's existing MediaTek 3.18 kernel with our own PID 1 and
+our own busybox, with bionic and tinyalsa mounted read-only from the device's
+`/system`.
 
-**Status: 0.1, bench-proven, not field-proven.** One device, two days. A
-complete voice turn has run on it — wake word scored on-device, Home Assistant
-pipeline, spoken answer — along with WiFi, the 9-channel mic array, hardware
-AEC, the BLE proxy, buttons, ambient light, jack detect and the LED ring. The
-known gaps are listed at the bottom and none of them is a research problem.
+> **⚠️ emOS needs the FireOS 5 kernel, so do not install amonet-biscuit
+> v2.0.0.** Version 2.0.0 of the unlock (10 September 2026) replaces the
+> Echo's bootloaders, and after that FireOS 5, and with it emOS, no longer
+> boots. The emOS init is also a 64-bit (aarch64) binary, which FireOS 6's
+> 32-bit kernel cannot run. Unlock with **v1.1.0**. If you have already
+> installed v2.0.0, **do not try to go back by flashing FireOS 5 or an older
+> amonet**: that rewrites bootloaders by hand, which is how an Echo gets
+> hard-bricked. See the top of [`docs/rooting.md`](../docs/rooting.md).
 
-`emos-v0.1` is tagged and published so the provisioning wizard can fetch the
-init, which is the only part of an image that can be distributed. **A tag is
-not a claim that this is finished**: it has run on one device, and the wizard
-that installs it has not been through a full run on hardware at all. Try it on
-a spare Echo, and read the Known gaps first — in particular, a device on emOS
-cannot be re-provisioned by the wizard, and going back wipes it.
+**Status: 0.4, bench-proven, not field-proven.** Still a small number of
+devices over a handful of days. A complete voice turn has run on it — wake word
+scored on-device, Home Assistant pipeline, spoken answer — along with WiFi, the
+9-channel mic array, hardware AEC, the BLE proxy, buttons, ambient light, jack
+detect and the LED ring. The known gaps are listed at the bottom and none of
+them is a research problem.
+
+Three things changed since 0.1 that are worth knowing before you try it:
+
+- **The provisioning wizard has now run end to end**, on a device restored to
+  genuine stock. It failed at four different steps first, and every one of
+  those failures was in a *check* rather than in the operation being checked.
+- **emOS updates in place, over the network.** A device was taken 0.1 → 0.3
+  with no TWRP, no cable and no wipe. So a bug in a released emOS is something
+  we can push a fix for, rather than something that strands a device.
+- **emOS is no longer a one-way door.** `/init recovery` reboots the device
+  into TWRP from its own console, and the wizard's first step already accepts
+  a device that is in TWRP — so emOS → recovery → re-provision is a path that
+  works, without powering the device off and holding the mute button in the
+  dark. New in 0.4, confirmed on hardware 2026-09-10.
+
+`emos-v0.4` is tagged and published so the wizard can fetch the init, which is
+the only part of an image that can be distributed. **A tag is not a claim that
+this is finished.** Try it on a spare Echo, and read the Known gaps first.
 
 ## Why
 
@@ -31,7 +53,7 @@ than that in one sense and much thicker in another:
 - SETUP.md claimed Amazon's audio HAL was what started the I2S clock and that
   playback would hang without it. **That was reasoning, not measurement, and it
   is false.** Both directions clock with no HAL, no mediaserver and no
-  framework.
+  framework. (SETUP.md now carries the correction rather than the claim.)
 - But the HAL *was* silently configuring the codec for us. Nothing in the
   firmware ever closed the codec's DAPM routes, because the HAL always got
   there first. On a device with no Android, both the microphones and the
@@ -48,7 +70,9 @@ class of dependency visible. No log, test or dashboard could show it.
 #    build input and the recovery image.
 adb shell su -c 'dd if=/dev/block/mmcblk0p10' > boot_a_x.img
 
-# 2. Build. Reuses the kernel and DTBs out of your own image.
+# 2. Build. Reuses the kernel and DTBs out of your own image, and builds the
+#    init for that kernel's architecture: 64-bit for FireOS 5, 32-bit ARM for
+#    FireOS 6 (untested on hardware as of 2026-09-11).
 ./build.sh boot_a_x.img emos-boot.img
 
 # 3. Flash (TWRP, or over the network from a running emOS — see below).
@@ -62,8 +86,8 @@ what made a day of failed boots cheap rather than frightening.
 Or use the **provisioning wizard**, which does all three from TWRP and never
 boots Android: it escrows your boot partition (and hands you the file), sends
 it to the controller to be repacked, flashes it and reads it back to check.
-The wizard is the emOS path by default; `?flow=fireos` still runs the old
-thirteen-step FireOS install.
+The wizard defaults to emOS and offers FireOS beside it on the first step;
+`?flow=fireos` still selects the old thirteen-step FireOS install directly.
 
 ### Releasing emOS
 
@@ -72,11 +96,11 @@ with `git describe --match 'emos-v*'`, so without those tags it stamps
 whatever tag is nearest — a controller release number, which is worse than
 "unknown" because it looks plausible. The namespace also keeps emOS out of the
 firmware OTA's way: `_fetch_latest_release` selects a tag starting `v` with a
-`server` asset, and `emos-v0.1` matches neither.
+`server` asset, and `emos-v0.4` matches neither.
 
 ```sh
-git tag -a --cleanup=verbatim emos-v0.1 -m "..."   # -a always; the annotation IS the notes
-git push origin emos-v0.1
+git tag -a --cleanup=verbatim emos-v0.4 -m "..."   # -a always; the annotation IS the notes
+git push origin emos-v0.4
 ```
 
 `emos-release.yml` compiles the init with the pinned NDK, asserts it is
@@ -129,9 +153,78 @@ every one of them is a comment in the source rather than folklore:
 
 ### WiFi
 
-Amazon's own sequence, read off a running FireOS device rather than
-reconstructed — but two steps appear in no `.rc` file on the device and were
-each found the hard way. `wmt_loader` must run **first** (it registers the
+**On FireOS 6 none of Amazon's networking binaries can be used, so emOS does
+it itself.** `wmt_loader` exits 255 there where FireOS 5's exits 0,
+`wmt_launcher` runs and sits silent, and both `wpa_supplicant` and `dhcpcd`
+abort before `main()` — traced to `open /dev/binder -> -1`; they are linked
+against Android IPC that emOS deliberately does not provide. The answer was
+not to give emOS a property service and a binder node so that Amazon's tools
+are happy, which would make their userspace *more* load-bearing, but to
+replace them:
+
+- **The combo chip is brought up by init**, from MediaTek's GPL source:
+  `SET_PATCH_NAME` and `SET_STP_MODE` on `/dev/stpwmt` configure the HIF
+  (`(fm << 4) | stp`; biscuit is BTIF, `0x23`), then a daemon loop answers the
+  driver's `srh_patch` requests with `SET_PATCH_NUM` and `SET_PATCH_INFO`.
+  The patch download order runs **backwards** through the sorted names —
+  `ROMv2_lm_patch_1_0` is sequence 2 — and the address is
+  `{0, 0, hdr[0x1A], hdr[0x1B]}`; offset 0x18 is the tail of `ucPLat` in the
+  28-byte header. Both were read off Amazon's own launcher under an
+  `LD_PRELOAD` ioctl shim rather than guessed. This drops `wmt_loader` and
+  `wmt_launcher` on **both** kernels.
+- **emOS ships its own `wpa_supplicant`** — hostap 2.10, static ARM32,
+  nl80211, internal crypto, ~1MB — built by `tools/build-wpa-supplicant.sh`.
+  Four things in that script are load-bearing and each cost a build: full
+  libnl will not cross-compile against bionic (use OpenWrt's libnl-tiny,
+  patched to defer to `<linux/netlink.h>`), hostap's `priv_netlink.h` needs
+  the same and its system includes must precede its `#ifndef IFLA_*`
+  fallbacks, bionic ships no `librt`, and **WEXT is not an option on this
+  driver** — it scans but association never completes.
+- **DHCP on FireOS 6 is busybox `udhcpc`**, which needs a script to apply a
+  lease it has already obtained; without one it gets an address and discards
+  it, which reads as a DHCP failure and is not.
+- **emOS mounts the `/system` its image was BUILT beside**, named by
+  `emos.system=/dev/block/mmcblk0pN` on its own cmdline and parsed by
+  `cmdline_system_part()`. It used to hardcode p13, which is right only while
+  the reference comes from slot A — and since the wizard now leaves stock FireOS
+  in its own slot and puts emOS in the other, the boot slot and the system slot
+  are deliberately different values. Absent, it falls back to p13, so images
+  built before this keep booting exactly as they did.
+
+  An emOS image is Amazon's kernel plus our ramdisk and nothing else; bionic,
+  the linker, tinyalsa, `/system/bin/sh` and the WiFi firmware all come from
+  `/system` at runtime. So an image is a PAIR — a kernel and the userspace it
+  was taken beside — and the pairing travels with the image rather than being
+  guessed at each boot. Read it with `od` on the image or from `/proc/cmdline`
+  on a running device; `cmdlinecheck.c` pins the parser.
+- **emOS ships its own busybox** — 1.38.0, static ARM32, built by
+  `tools/build-busybox.sh`. A FireOS 6 `/system` has toybox and **no busybox at
+  all**, so without ours there is no `udhcpc` (hence no address), no `ntpd`, no
+  `syslogd`/`klogd`, and no `awk` for `em-wifi` to read a scan with. It was
+  working on the first FireOS 6 device only because amonet v2's OPTIONAL root
+  component had left one at `/data/local/bin/busybox` — which is the rule that
+  cost: **emOS must not depend on anything that is optional for the unlock.**
+
+  It is built on **Alpine, not the NDK**, and that is the one deliberate
+  exception to the pinned-toolchain rule. The binary is static, so it needs
+  only the kernel's syscall ABI — bionic is a free choice and the wrong one.
+  `defconfig` against the NDK needs eight source patches and twenty applets
+  disabled, and clang 9 segfaults compiling `hush.c`; against musl the same
+  `defconfig` builds with none of that. The only thing trimmed is the eleven
+  listening daemons (`telnetd`, `httpd`, `inetd`, …), which is a posture
+  choice, not a build one.
+
+  `busybox_path()` looks in `/system` FIRST and `/sbin` last, so the FireOS 5
+  fleet keeps running on Amazon's copy and only FireOS 6 — where none of this
+  ever worked — gets ours.
+
+FireOS 5 keeps Amazon's supplicant and `dhcpcd` unless an image carries ours,
+because that path works on the fleet today and should not be swapped for
+something untested by a build-time default.
+
+The FireOS 5 sequence below is Amazon's own, read off a running device rather
+than reconstructed — but two steps appear in no `.rc` file on the device and
+were each found the hard way. `wmt_loader` must run **first** (it registers the
 stp/wmt/BT character devices; without it `6620_launcher` idles forever with
 nothing to open), and `wpa_supplicant` does not associate on its own here — it
 needs a `wpa_cli reassociate` nudge, which the supervisor issues until carrier
@@ -179,6 +272,40 @@ diagnosis (two shells fighting over one tty; there was one, and the second
 console — a script here, or the provisioning wizard over WebSerial, which has
 no `stty` to remind you — must do it explicitly.
 
+### Getting to TWRP: `/init recovery`
+
+**`/system/bin/reboot` cannot reboot an emOS device at all**, and the way it
+fails is misleading. It reaches Android's property service over
+`/dev/socket/property_service`, which nothing here runs, so `connect()` returns
+ENOENT and it prints `reboot: No such file or directory` — naming a missing
+file, where the file it means is a socket that was never going to exist. It
+fails identically with **no argument**, which is the tell: this is not the
+recovery path being unavailable, it is Amazon's userspace talking to an Android
+that is not there.
+
+What `adb reboot recovery` actually does is one syscall — `RESTART2` carrying a
+mode string, which MediaTek's restart handler turns into the value LK reads on
+the next boot. No property service, no ueventd, no by-name symlinks, no BCB
+write into `misc`. The init owns that syscall and runs as a tool when it is not
+PID 1, so from the console:
+
+```
+/init recovery
+```
+
+Confirmed on hardware 2026-09-10: the kernel accepts the string and LK acts on
+it, landing in TWRP.
+
+**The multi-call discriminator is `getpid()`, not `argc`.** The kernel can pass
+arguments to init from the boot cmdline, so a device whose bootloader appended
+one would take the tool path and never boot — a brick produced by an argument
+nobody typed.
+
+This matters beyond convenience: a device on emOS has no adb, so "get a binary
+onto it" is a real problem rather than a step, and reaching TWRP used to mean a
+power-off and a held mute button. Re-provisioning an emOS device is now a
+command from the console you are already connected to.
+
 ### The console password
 
 The console is an unauthenticated root shell — anyone with a cable gets one,
@@ -222,21 +349,46 @@ would only ever trap the owner.
 ### What the kernel cmdline actually contains
 
 `/proc/cmdline` is not the boot image's cmdline: **LK appends its own
-parameters after ours, including a DUPLICATE `androidboot.selinux=enforce`
-that supersedes the `permissive` token the provisioning wizard patches in.**
-LK also supplies `androidboot.hardware`, `androidboot.slot_suffix` and
-`androidboot.serialno` — the last being where the firmware's serial fallback
-gets it on a system with no property service.
+parameters after ours, including a DUPLICATE `androidboot.selinux=enforce`.**
+It does NOT supersede the `permissive` token the wizard patches in — the
+FIRST occurrence wins, for the reason set out under "What the slots actually
+contain" below. LK also supplies `androidboot.hardware`,
+`androidboot.slot_suffix` and `androidboot.serialno` — the last being where
+the firmware's serial fallback gets it on a system with no property service.
 
 Nothing under emOS reads any of them: there is no `/sys/fs/selinux` and no
 SELinux line in `dmesg`. So the wizard's permissive patch is inert here, which
 is why an emOS install does not need the boot patch at all.
 
-### WiFi comes from /data, and wpa_supplicant makes its own entropy
+### WiFi comes from /data — but emOS keeps its OWN file
 
-`wpa_supplicant.conf` and `entropy.bin` both live in `/data/misc/wifi`, so
-they survive a boot-partition write — which is what lets a device be
-configured over adb on FireOS and then crossed to emOS. **`entropy.bin` is
+**emOS reads `/data/emos/wpa.conf`, not Android's `wpa_supplicant.conf`**, and
+falls back to Android's only when it has none of its own. `/data` survives a
+boot-partition write and is shared with whatever else the device can boot: a
+user who boots FireOS 6 from the other slot has Amazon's supplicant rewrite
+`/data/misc/wifi/wpa_supplicant.conf` with fields ours rejects, and **one
+unusable field discarded the whole network block** — leaving a device that
+boots, throbs at stage 11 for ever and is invisible on the network, so
+recovery needs a cable. Same lesson as `console.pw`: anything on `/data`
+belongs to whoever wrote it last.
+
+Two more defences, because each covers the other's blind spot. Our supplicant
+is patched to **warn and carry on** for a line it cannot use rather than
+discarding the network — and both the network *and* the global parse sites
+need it, since `p2p_no_group_iface` is a global and kills the file before the
+network block is read. (Upstream already does exactly this for unsupported
+WEP parameters.) And **no conf at all is a wait, not a failure**: the wizard
+writes WiFi over the console *after* emOS is running, so init holds at stage
+11, starts no supplicant, and picks the file up the moment it appears. A conf
+that is present and not working turns the ring red after two minutes.
+
+**`em-wifi` sets the network from the console** — scan, pick a number, type a
+password, and it waits to see an address before claiming success. WPA3 and WEP
+networks are listed and refused with the reason rather than offered and then
+failing at association. That is the way back for a device that has moved house
+or come back from FireOS, without a full re-provision.
+
+`entropy.bin` lives in `/data/misc/wifi` alongside Android's conf. **`entropy.bin` is
 created if absent**: deleted on EFF, the device rebooted and was back on WiFi
 in 25 seconds with the file recreated. A device that never completed Alexa
 setup is not stranded.
@@ -257,6 +409,71 @@ device provisioned straight to emOS has never had one, so the wizard now
 writes a skeleton (`ctrl_interface` + `update_config=1`) while `/data` is
 writable and before the flash. Recovering by hand needs only those two lines
 and a reboot.
+
+### The console banner
+
+A shell on `/dev/ttyGS0` opens with the device's name, serial, address, the
+controller it is connected to, and where the logs are. Somebody on this console
+is usually there because something is wrong, over a USB cable, with no
+dashboard — these are the facts they would otherwise spend five minutes
+gathering.
+
+**The controller address is read from `/proc/net/tcp`, not from a stored
+value**, because there is not one: the firmware keeps its last-known server in
+memory only. An ESTABLISHED connection to 8767 or 8770 IS the controller, so
+the banner names who the device is talking to NOW, and says "not connected"
+when there is nobody.
+
+The version is read from `/etc/os-release` rather than compiled in, so it
+cannot disagree with the file `build.sh` stamps. It prints AFTER
+`console_gate()`, so it is not a free hint to somebody who has not answered the
+password prompt.
+
+**It also constrains the wizard.** Step 8 decides a device is emOS by reading
+`/etc/os-release` over this console, and the banner now says "emOS" and the
+version too — so that check is anchored to `^ID=emos$` rather than matching the
+substring anywhere in the reply. A loose match could otherwise be satisfied by
+the banner rather than the file, which is a false positive on the one test that
+gates continuing after a partition write.
+
+**The eMMC reports its own wear, and debugfs is how you read it.** The flash
+carries `PRE_EOL_INFO` and two life-time estimates in its Extended CSD, and on
+this kernel the only route to them is
+`/sys/kernel/debug/mmc0/mmc0:0001/ext_csd` — the generic sysfs `life_time` and
+`pre_eol_info` attributes are a Linux 4.9 addition and 3.18 has neither, and
+Samsung's vendor `samsung_smart` answers `version 0, error mode: Invalid`. init
+mounts debugfs for this; without it the directory is empty and the health of
+the part we write to is unreadable on the OS doing the writing.
+
+Byte 192 is `EXT_CSD_REV` (7 or above means the health fields are defined at
+all), 267 is `PRE_EOL_INFO` (1 normal, 2 at 80% of reserved blocks consumed, 3
+urgent), 268 and 269 are the SLC and MLC life-time estimates in 10% steps from
+1 to 11. Both devices measured 2026-09-06 carry the same part — Samsung
+`FJ25AB`, 08/2017 — and read `PRE_EOL_INFO` normal with life-time 0x01 and
+0x02, so they differ by one bucket for reasons nobody recorded. That is the
+argument for reporting it: at 10% granularity a baseline taken before there is
+a problem is the only thing that makes a later difference answerable.
+
+**Nothing routine writes to the eMMC.** `/run/net.log` (128KB, one rotation)
+takes netlog's own lines AND every spawned child's stdout and stderr —
+wmt_loader, wpa_supplicant, dhcpcd, ntpd and the wpa_cli nudge — and syslogd
+writes `/run/messages` at 256KB x 2. Both are tmpfs.
+
+That log lived on `/data` and was appended with no bound until 2026-09-06, so a
+device that could not join its network wrote to flash every five seconds for
+ever, in exactly the failure state nobody is watching. The trade is that it
+does not survive a reboot, which is right: it answers "why is the network not
+up NOW", read over the console while the device is running, and a crash that
+spans a reboot is what the `last_kmsg` copies are for.
+
+The persistent writers are all bounded and all write on CHANGE rather than on a
+timer: `boot.state` once per boot, `last_kmsg.{prev,1,2}` rotated three deep,
+`console.pw` and `wpa_supplicant.conf` when they change, and `boot-good.img`
+only when the boot header's SHA1 image id differs from the stored one — a size
+check would never promote a new image, since every emOS build so far is the
+same length. The firmware's `supervisor.log` is trimmed to 32KB before each
+append; its `server.log` is on tmpfs and trimmed (it reached 45MB once, in
+2026-07).
 
 **`reboot` does nothing; use `busybox reboot`.** Plain `reboot` signals init,
 and emOS's init does not handle that signal, so it exits silently having done
@@ -282,12 +499,17 @@ Three layers, three different answers, and the design follows from them:
 - **Amazon's `/system`** — bionic, the linker, tinyalsa, wpa_supplicant. No
   licence to redistribute. Mounting it at runtime on a device that already has
   it is a different act from shipping it.
-- **Our code** — MIT, like the rest of the repo. busybox is GPL-2.0 and is the
-  device's own copy, not ours.
+- **Our code** — MIT, like the rest of the repo.
+- **busybox** — GPL-2.0, and since `emos-v0.6` it is OURS: we build it and the
+  release publishes the binary. That is the only licence here that obliges us
+  to offer SOURCE, so the release notes carry the pinned upstream URL and point
+  at `tools/build-busybox.sh`, which is the complete recipe. Keep that in the
+  notes. On FireOS 5 the copy in use is still the device's own.
 
 Leaning on `/system` is legally clean but pins emOS to one FireOS build. A
-self-contained ramdisk would need our own userspace — a static Go binary and
-busybox, no bionic. Not legal advice; and never ship Amazon marks or branding.
+self-contained ramdisk would need our own userspace — a static Go binary, and
+the busybox and supplicant we now ship, with no bionic. Not legal advice; and
+never ship Amazon marks or branding.
 
 ## How it boots, and what the ring tells you
 
@@ -505,19 +727,17 @@ boots, which is what recovery is for.
 
 **The cmdline patch preserves the original arguments.** `runPatchBoot` appends
 `androidboot.selinux=permissive` to the existing NUL-terminated field if absent.
-It does
-not replace FireOS's `bootopt`, `rootwait`, `init`, build-variant or verity
-arguments, and it refuses to patch if the combined value cannot fit while
-retaining a terminator. It replaces each existing
+It does not replace FireOS's `bootopt`, `rootwait`, `init`, build-variant or
+verity arguments, and it refuses to patch if the combined value cannot fit
+while retaining a terminator. It replaces each existing
 `androidboot.selinux=enforce` token in place with
 `androidboot.selinux=permissive`, preserving all other argument bytes and
 whitespace. Other unknown SELinux values are refused. Appending a duplicate
 cannot safely override the first value. The wizard validates the actual field
 even when the unpack log contains `permissive`; it skips rewriting the cmdline
 only when the bounded transformation leaves the image unchanged.
-Earlier wizard versions zeroed bytes
-64-576 and wrote
-only 51 bytes; the device happened to boot because LK supplied `root=`,
+Earlier wizard versions zeroed bytes 64-576 and wrote only 51 bytes; the device
+happened to boot because LK supplied `root=`,
 `androidboot.hardware` and the rest, and the kernel defaults covered what was
 left. Slot B was the only reason the loss was visible.
 
@@ -530,12 +750,24 @@ FIRST occurrence wins. Measured on 0C95 and 71VVV, 2026-09-06: `getenforce`
 Permissive, `ro.boot.selinux` permissive. The FireOS flow depends on this
 working - do not remove it.
 
-The append keeps the ordering property: the image's permissive value still
-lands ahead of LK's `enforce`. The observed 215-byte field plus the appended
-argument fits within 512 bytes. The byte-level behavior is covered by a Node
-regression test, but the revised image still needs a hardware boot test. Do NOT
-copy slot B's cmdline as a template: its `bootopt` third field is `32N2`
-against slot A's `64N2`, so it is a different build.
+The intuition to resist is that a later cmdline token overrides an earlier
+one. That holds for parameters the KERNEL parses, and `androidboot.selinux`
+is not one of them - the kernel's own switches are `selinux=` and
+`enforcing=`, which nothing here sets. `androidboot.*` is read by Android's
+init, and a write-once property gives the opposite precedence to the one a
+kernel parameter would. Both tokens on the cmdline with the device reading
+permissive IS the measurement that settles it.
+
+When the image has no SELinux argument, appending preserves that ordering: the
+image's permissive value still lands ahead of LK's `enforce`. When the image
+already carries `androidboot.selinux=enforce`, replacing that token in place
+sets the first image-owned value correctly without discarding any other
+argument. The observed 215-byte field plus the appended argument fits within
+512 bytes. The byte-level behavior is covered by a Node regression test, but
+the revised image still needs a hardware boot test, since an argument that is
+currently absent and unmissed may matter on another device. Do NOT copy slot
+B's cmdline as a template: its `bootopt` third field is `32N2` against slot A's
+`64N2`, so it is a different build.
 
 **`misc` (`p8`) holds a boot-control block, and it is empty.** 4KB of zeros
 with one record at offset **0x360**:
@@ -634,23 +866,53 @@ is not proof it rebooted — compare uptime or a build fingerprint.
   toggling it clicks audibly, which is why the injected silence stream exists.
 - Hardware is resolved by fixed major/minor numbers, against the project's own
   "resolve by name, not number" rule. Fine for biscuit, wrong for a second
-  board.
+  board. `/system` and `/data` are likewise hardcoded to p13 and p16; those
+  were checked on a FireOS 6 device under amonet v2 and are still correct
+  there, but nothing enforces it.
+- **The provisioning wizard cannot install a FireOS 6 image yet.** It fetches
+  the `init` asset from the emOS release and hands it to the controller's
+  packer; the supplicant and `wpa_cli` need the same road — a second release
+  asset, an endpoint, and a passthrough. The packer half already accepts
+  them. A locally built image installs today. Publishing them is allowed for
+  the same reason `init` is: they are our build (hostap is BSD, libnl-tiny
+  LGPL) and contain no Amazon code, unlike a boot image.
+- **WPA3 is one layer away, not three.** Asked of the driver rather than
+  inferred from kernel strings: userspace is solved, since emOS now ships a
+  supplicant with SAE; **PMF is not blocked** — the driver advertises
+  BIP-CMAC-128, which corrects a previously recorded belief that the closed
+  firmware prevented it; but the driver does not do SAE and
+  `NL80211_CMD_EXTERNAL_AUTH`, which would let the supplicant do it instead,
+  is a Linux 4.17 addition on a 3.18 kernel. Both cfg80211 and the wlan
+  driver are built in, so there is no module to replace — it is a kernel
+  build, which puts it on the same fork as the arm64 kernel work.
 - The boot trail is a fixed-size buffer rewritten in place, so a shorter trail
   leaves the tail of the previous boot's behind and can be misread.
-- **A device on emOS cannot be re-provisioned by the wizard, and nothing in
-  the wizard says so.** Step 0 needs adbd, which emOS does not have and will
-  not — `f_acm` is the whole point of not needing a daemon. So the USB picker
-  offers nothing and the step fails with an error about the wrong device,
-  which does not name the actual reason. The duplicate-serial guard would
-  refuse it a second time over, since a provisioned device is registered.
+- **A device on emOS cannot start the wizard directly, and nothing in the
+  wizard says so** — but since 0.4 there is a one-command way round it, so
+  this is an unhelpful error rather than the dead end it was.
+
+  Step 0 needs adbd, which emOS does not have and will not — `f_acm` is the
+  whole point of not needing a daemon. So the USB picker offers nothing and
+  the step fails with an error about the wrong device, which does not name the
+  actual reason.
+
+  **`/init recovery` from the console is the way through.** The wizard's first
+  step already accepts a device that is in TWRP (it reads the FireOS build off
+  `/system`, since every property in recovery belongs to the ramdisk), so
+  reaching recovery is the whole of what was missing. What remains is that
+  nothing tells you that, and the duplicate-serial guard still refuses a
+  device that is already registered — it offers to delete it, which is the
+  right answer but has to be found.
 
   Noticed by Wil on 2026-09-05, after the flow was built. The design's open
   questions covered FireOS → emOS and deferred it; **nobody asked the
   reverse**, which is how it got this far.
 
-  Three paths exist and none of them is in the wizard:
+  The other three paths remain, and none of them is in the wizard either:
 
-  - **Return to stock, by hand.** Boot into TWRP with the button combo, wipe
+  - **Return to stock, by hand.** Boot into TWRP — unplug the power, hold
+    **mute** down, and apply power with it still held, until the ring shows an
+    alternating cyan pattern — then wipe
     cache, wipe data, sideload the FireOS 5 image, **and then flash
     `f1r30s.zip`**. That last step is not optional: a stock flash restores
     dm-verity against a partition table the unlock modified, so **the OS will
@@ -669,9 +931,12 @@ is not proof it rebooted — compare uptime or a build fingerprint.
     re-provision and needs no USB at all.
   - **The console**, for a device that is on emOS but not on the network.
 
-  The middle one is the fix worth building, and it is the same self-flash the
-  design deferred for FireOS → emOS. Until then this is a one-way door: keep
-  the escrowed boot image.
+  The middle one is still the fix worth building, and it is the same self-flash
+  the design deferred for FireOS → emOS — it needs no USB and no recovery at
+  all. It is no longer urgent, though: `/init recovery` plus the wizard's
+  existing TWRP entry covers the case that mattered. Keep the escrowed boot
+  image regardless; it is the ten-second undo for a device that will not boot,
+  which is the one situation none of these paths help with.
 
 ## What emOS is worth beyond the stunt
 

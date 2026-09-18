@@ -85,6 +85,7 @@ import em_announce
 import em_recordings
 import em_runbarrier
 import em_oww_models
+import em_oww_metadata
 import em_player
 import em_timers
 import em_turnclock
@@ -118,6 +119,13 @@ class TurnTrace:
     trigger:          str   = ""      # "wakeword(0.522)" or "button"
     t0:               float = 0.0     # turn start (time.monotonic())
     t_first_frame_ms: int   = -1      # ms from t0 to first real audio frame
+    # ms from t0 to HA's STT_VAD_START. Stays -1 when HA's VAD never engaged,
+    # which is the whole point of recording it: that is the turn shape that
+    # runs to HA's 15s cap, and until now nothing distinguished it from a turn
+    # HA endpointed properly. It is also the number the fallback's grace
+    # window should be tuned from — 2.5s is currently set against a single
+    # measured turn (1.077s) plus microVAD's floor of ~1.06s.
+    t_vad_start_ms:   int   = -1
     t_vad_end_ms:     int   = -1      # ms from t0 to VAD sentinel received
     audio_frames:     int   = 0       # number of PCM frames sent to HA
     t_stt_ms:         int   = -1      # ms from t0 to STT result received
@@ -172,6 +180,7 @@ class TurnTrace:
             f"[TURN] trigger={self.trigger} outcome={self.outcome} "
             f"total={fmt(self.t_complete_ms)} "
             f"first_frame={fmt(self.t_first_frame_ms)} "
+            f"vad_start={fmt(self.t_vad_start_ms)} "
             f"vad_end={fmt(self.t_vad_end_ms)} audio={self.audio_frames}frames/{audio_ms}ms "
             f"stt={fmt(self.t_stt_ms)} text={self.stt_text!r} "
             f"tts_url={fmt(self.t_tts_url_ms)} "
@@ -328,6 +337,7 @@ class EchoMuseSatellite(SatelliteServerProtocol):
         mac_address: str,
         oww_model_id: str,
         on_disconnected_cb,
+        oww_model_info,
         owning_server=None,   # DeviceESPhomeServer — back-reference so the
                               # standalone-announce path can read the live
                               # _standalone_play callback rather than a
@@ -344,6 +354,7 @@ class EchoMuseSatellite(SatelliteServerProtocol):
         self.label          = label
         self.mac_address    = mac_address
         self.oww_model_id   = oww_model_id
+        self.oww_model_info = oww_model_info
         self._owning_server  = owning_server
         # Strong references to in-flight timer-event tasks (see the
         # VoiceAssistantTimerEventResponse branch).
@@ -630,8 +641,8 @@ class EchoMuseSatellite(SatelliteServerProtocol):
                 available_wake_words=[
                     api_pb2.VoiceAssistantWakeWord(
                         id=self.oww_model_id,
-                        wake_word=em_oww_models.display_name(self.oww_model_id),
-                        trained_languages=["en"],
+                        wake_word=self.oww_model_info.name,
+                        trained_languages=list(self.oww_model_info.languages),
                     )
                 ],
                 active_wake_words=[self.oww_model_id],
@@ -893,6 +904,8 @@ class EchoMuseSatellite(SatelliteServerProtocol):
             # _stream_mic_audio (covers quiet speech in a noisy room that
             # misses the 3×-floor test there).
             self._ha_vad_start.set()
+            if self._trace and self._trace.t_vad_start_ms == -1:
+                self._trace.t_vad_start_ms = self._trace.elapsed_ms()
 
         elif event_type == ET.VOICE_ASSISTANT_STT_VAD_END:
             # Speech ended — HA is now processing (STT → intent → TTS).
@@ -1521,6 +1534,7 @@ class EchoMuseSatellite(SatelliteServerProtocol):
                     "noise_floor":    wi.get("noise_floor"),
                     "outcome":        trace.outcome,
                     "total_ms":       trace.t_complete_ms,
+                    "vad_start_ms":   trace.t_vad_start_ms,
                     "vad_end_ms":     trace.t_vad_end_ms,
                     "stt_ms":         trace.t_stt_ms,
                     "tts_url_ms":     trace.t_tts_url_ms,
@@ -1652,6 +1666,16 @@ class EchoMuseSatellite(SatelliteServerProtocol):
         listening_since = None      # monotonic; set when the first real frame lands
         turn_start = time.monotonic()
 
+        # Controller-side endpointing, armed only when HA's VAD has been ruled
+        # out — see em_turnclock.ha_vad_stalled_verdict for why the absence of
+        # STT_VAD_START is the discriminator and not a timer. These two marks
+        # are what that verdict reads. Keeping them current costs one RMS over
+        # an 80ms frame for the whole turn rather than only until the first
+        # hit, which is the same arithmetic the barge watcher already runs per
+        # frame throughout playback.
+        first_speech_at = None
+        last_speech_at  = None
+
         def _is_speech(chunk: bytes) -> bool:
             samples = np.frombuffer(chunk, dtype=np.int16)
             if samples.size == 0:
@@ -1704,6 +1728,25 @@ class EchoMuseSatellite(SatelliteServerProtocol):
                     )
                     self._send_one(api_pb2.VoiceAssistantAudio(data=b"", end=True))
                     self._no_speech_timeout = True
+                    return
+
+                # HA's VAD failed to engage — endpoint the turn ourselves
+                # rather than sitting out HA's 15s cap. This is a real end of
+                # speech, so it takes the same exit as the device sentinel
+                # below: end=True to HA, and the thinking transition, or the
+                # ring stays lit through STT and intent (#370).
+                stalled, stall_why = em_turnclock.ha_vad_stalled_verdict(
+                    now=time.monotonic(), speech_seen=speech_seen,
+                    ha_vad_started=self._ha_vad_start.is_set(),
+                    first_speech_at=first_speech_at,
+                    last_speech_at=last_speech_at,
+                )
+                if stalled:
+                    log.info(f"[{self._log_name}] {stall_why} — sending audio end to HA")
+                    if self._trace and self._trace.t_vad_end_ms == -1:
+                        self._trace.t_vad_end_ms = self._trace.elapsed_ms()
+                    self._send_one(api_pb2.VoiceAssistantAudio(data=b"", end=True))
+                    self._enter_thinking()
                     return
 
                 # Race the queue-get against _ha_vad_end directly rather than a
@@ -1783,7 +1826,16 @@ class EchoMuseSatellite(SatelliteServerProtocol):
                     if self._trace:
                         self._trace.t_first_frame_ms = self._trace.elapsed_ms()
 
-                if not speech_seen and _is_speech(payload):
+                # Every frame, not just until the first hit: the controller's
+                # own endpoint needs to know when speech LAST was, not only
+                # that it once happened.
+                if _is_speech(payload):
+                    now = time.monotonic()
+                    last_speech_at = now
+                    if first_speech_at is None:
+                        first_speech_at = now
+
+                if not speech_seen and last_speech_at is not None:
                     speech_seen = True
                     log.debug(
                         f"[{self._log_name}] Speech detected (above noise floor "
@@ -2181,11 +2233,20 @@ class DeviceESPhomeServer:
     inbound connection is rejected with DisconnectResponse + close.
     """
 
-    def __init__(self, device_id: str, label: str, mac_address: str, oww_model_id: str, port: int) -> None:
+    def __init__(
+        self,
+        device_id: str,
+        label: str,
+        mac_address: str,
+        oww_model_id: str,
+        port: int,
+        oww_model_info,
+    ) -> None:
         self.device_id    = device_id
         self.label        = label
         self.mac_address  = mac_address
         self.oww_model_id = oww_model_id
+        self.oww_model_info = oww_model_info
         self.port         = port
         self._server: Optional[asyncio.AbstractServer] = None
         self._active_satellite: Optional[EchoMuseSatellite] = None
@@ -2311,6 +2372,7 @@ class DeviceESPhomeServer:
             label=self.label,
             mac_address=self.mac_address,
             oww_model_id=self.oww_model_id,
+            oww_model_info=self.oww_model_info,
             on_disconnected_cb=self._on_satellite_disconnected,
             owning_server=self,
         )
@@ -2452,8 +2514,9 @@ async def _register_device_server(device_id: str, label: str | None) -> DeviceES
     # Get OWW model from device config
     config       = await loop.run_in_executor(None, db.get_device_config, device_id)
     # Custom models are file paths in config; HA sees the friendly stem.
-    oww_model_id = em_oww_models.prediction_key(
-        config.get("owwModel", "hey_jarvis_v0.1"))
+    model_name = config.get("owwModel", "hey_jarvis_v0.1")
+    oww_model_id = em_oww_models.prediction_key(model_name)
+    oww_model_info = await loop.run_in_executor(None, em_oww_metadata.resolve, model_name)
 
     # Re-check after the awaits above — a concurrent caller may have
     # created the server while we were in the executor.
@@ -2466,6 +2529,7 @@ async def _register_device_server(device_id: str, label: str | None) -> DeviceES
         label=label,
         mac_address=mac,
         oww_model_id=oww_model_id,
+        oww_model_info=oww_model_info,
         port=port,
     )
     # Capabilities that arrived before this server existed decide which HA
@@ -2848,7 +2912,7 @@ async def trigger_voice_turn(
     # configured, because a model is always configured; what varies is whether
     # it fired. Covers "wakeword(0.522)" and the on-device "wakeword-dev(…)".
     wake_word_phrase = (
-        em_oww_models.display_name(server.oww_model_id)
+        satellite.oww_model_info.name
         if trigger_label.startswith("wakeword") else ""
     )
 
@@ -2921,7 +2985,7 @@ async def push_media_state(device_id: str, state: str) -> None:
         log.debug(f"[{device_id}] media state push failed: {e}")
 
 
-def update_oww_model(device_id: str, model_id: str) -> None:
+async def update_oww_model(device_id: str, model_id: str) -> None:
     """
     Keep HA's wake-word dropdown honest.
 
@@ -2932,11 +2996,21 @@ def update_oww_model(device_id: str, model_id: str) -> None:
     by the next satellite instance) and bounce the active HA connection so
     HA redials (within seconds) and re-requests the configuration.
     """
-    model_id = em_oww_models.prediction_key(model_id)
     server = get_server(device_id)
-    if server is None or server.oww_model_id == model_id:
+    if server is None:
+        return
+    # Runtime initialization must not pause the audio event loop. A newer
+    # request wins if concurrent model reads complete out of order.
+    revision = getattr(server, "_oww_metadata_revision", 0) + 1
+    server._oww_metadata_revision = revision
+    model_info = await asyncio.to_thread(em_oww_metadata.resolve, model_id)
+    if get_server(device_id) is not server or server._oww_metadata_revision != revision:
+        return
+    model_id = em_oww_models.prediction_key(model_id)
+    if server.oww_model_id == model_id and server.oww_model_info == model_info:
         return
     server.oww_model_id = model_id
+    server.oww_model_info = model_info
     satellite = server.get_satellite()
     if satellite is not None:
         log.info(f"[{device_id}] OWW model → {model_id} — bouncing HA "

@@ -6,6 +6,7 @@ forgotten (bitten by em_scenes.py 2026-07-10 and em_oww_models.py
 2026-07-19).
 """
 
+import ast
 import re
 from pathlib import Path
 
@@ -48,7 +49,17 @@ def test_dashboard_bundle_is_cache_busted():
         "dashboard.html itself must be revalidated, or the new URL is never seen"
     # A version-string token would not change between two local "dev" builds;
     # mtime changes on every rebuild.
-    assert "st_mtime" in handler, \
+    # The token must be an mtime, not a version string: `version.py` reports
+    # "dev" for every local build and so would never change between two of
+    # them. The stamp moved into _bundle_version() when /api/system/status
+    # started publishing it for stale-tab detection, so the requirement is now
+    # that the handler uses that ONE definition and that the definition is an
+    # mtime — see test_the_bundle_stamp_has_exactly_one_definition.
+    assert "_bundle_version()" in handler, \
+        "the handler must take its token from _bundle_version()"
+    helper = src[src.index("def _bundle_version("):]
+    helper = helper[:helper.index("\nasync def ", 1)]
+    assert "st_mtime" in helper, \
         "cache-bust on the bundle's mtime, not on a version string"
 
 
@@ -315,8 +326,17 @@ def test_streamed_playback_waits_for_the_device_not_a_computed_sleep():
     fn = src[src.index("async def _run_streaming_post_turn_playback"):]
     fn = fn[:fn.index("\nasync def ", 1)]
 
-    assert "playback_done" in fn, \
+    # Named on the API rather than on a variable: `playback_done` was a single
+    # Event on the Device and became a queue of per-playback waiters (#373), so
+    # the thing to assert is that this path registers one and waits on it, not
+    # what the old attribute was called.
+    assert "begin_playback()" in fn, \
+        "streamed playback must register a playback waiter"
+    assert "playback_ev.wait()" in fn, \
         "streamed playback must await the device's playback_stats"
+    assert "end_playback(" in fn, \
+        ("the waiter must be retired in a finally, or a cancelled playback "
+         "takes the next one's report and desynchronises every one after it")
     assert "asyncio.sleep(remaining)" not in fn, \
         "the computed drain estimate was removed on 2026-07-24 — do not restore it"
 
@@ -822,6 +842,33 @@ def _fn_body(src: str, name: str) -> str:
     return src[start:start + 1 + end]
 
 
+def _js_fn_body(src: str, name: str) -> str:
+    """Slice one JavaScript function out of dashboard.jsx, by matching braces.
+
+    Braces rather than the next declaration, because these are nested inside
+    components at arbitrary indentation — there is no top-level boundary to cut
+    at, the way _fn_body has for Python. Strings and comments are not parsed, so
+    an unbalanced brace inside one would throw this off; none of the functions it
+    is pointed at contain one, and a bad slice fails the caller's assertion
+    rather than passing it.
+    """
+    for decl in (f"async function {name}(", f"function {name}("):
+        if decl in src:
+            start = src.index(decl)
+            break
+    else:
+        raise AssertionError(f"no function {name} in the source")
+    depth = 0
+    for i in range(src.index("{", start), len(src)):
+        if src[i] == "{":
+            depth += 1
+        elif src[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return src[start:i + 1]
+    raise AssertionError(f"function {name} is never closed")
+
+
 def test_firmware_transfer_is_verified_by_md5_not_by_an_exit_status():
     """
     TRANSFER_OK only ever proved that the decode pipeline and chmod exited 0 —
@@ -1279,12 +1326,12 @@ def test_wake_word_phrase_is_sent_and_matches_what_we_advertise():
 
     advertised = re.search(r"api_pb2\.VoiceAssistantWakeWord\((.*?)\)", src, re.S)
     assert advertised, "VoiceAssistantWakeWord advertisement not found"
-    assert "em_oww_models.display_name" in advertised.group(1), (
-        "the advertised wake_word must come from em_oww_models.display_name, "
+    assert "self.oww_model_info.name" in advertised.group(1), (
+        "the advertised wake_word must come from the connection metadata, "
         "the same source as the phrase we send")
 
-    assert 'display_name(server.oww_model_id)' in src, (
-        "the phrase must be derived with display_name too — a second spelling "
+    assert 'satellite.oww_model_info.name' in src, (
+        "the phrase must use the same connection metadata — a second spelling "
         "is how it drifts from what we advertised")
 
 
@@ -2176,6 +2223,34 @@ def test_the_reconcile_is_debounced_and_claimed_before_the_work():
     assert stamp < ret, "claim the debounce before returning, not after the work"
 
 
+def test_emos_crash_logs_are_checked_on_connect_before_the_debounce():
+    """
+    A device that crashed and reconnected inside the debounce window is the
+    one most worth looking at, so the crash check sits in front of it — and
+    only for a device that positively reported emOS, which is what saves the
+    ram console.
+    """
+    fn = _strip_prose(_fn_body(
+        (CONTROLLER / "em_api.py").read_text(), "reconcile_on_connect"))
+    assert "_collect_crash_log(" in fn
+    assert fn.index("_collect_crash_log(") < fn.index("_reconcile_due(")
+    gate = fn[:fn.index("_collect_crash_log(")]
+    assert "not live.android_userspace" in gate
+
+
+def test_the_crash_log_marker_is_written_only_after_a_complete_read():
+    """
+    The marker says "this boot was examined". Writing it before the read
+    completed would lose a crash to a dropped shell session.
+    """
+    fn = _strip_prose(_fn_body(
+        (CONTROLLER / "em_api.py").read_text(), "_collect_crash_log"))
+    read = fn.index("cat {kmsg}")
+    assert fn.index("_SHELL_OK not in out") > read
+    assert fn.index("summarise(") > fn.index("_SHELL_OK not in out")
+    assert fn.index("> {seen}") > fn.index("summarise(")
+
+
 def test_deleting_a_device_forgets_its_debounce():
     """
     A re-added device is the one whose payloads are least likely to be right;
@@ -2439,6 +2514,34 @@ def test_the_serial_console_disables_echo_before_anything_else():
         "with 'The port is already open'")
 
 
+def test_the_wizard_reads_the_device_list_the_way_the_api_returns_it():
+    """
+    /api/devices returns a bare ARRAY (`_ok([...])`), not {devices: [...]}.
+
+    The emOS WiFi step read `.devices` off it, which is undefined, and the
+    `|| []` turned that into an empty list on every pass — so its wait loop
+    never examined a single device and always timed out on a device that had
+    registered perfectly. Three successive rewrites of the success condition
+    were all debugging a predicate that was never evaluated against anything
+    (2026-09-06).
+
+    A shape mismatch between an endpoint and its caller is invisible at every
+    layer: the fetch succeeds, the parse succeeds, and the empty result is
+    indistinguishable from "nothing matched yet".
+    """
+    src = _jsx()
+    assert "(await API.get('/api/devices')).devices" not in src, (
+        "/api/devices returns an array; reading .devices off it is silently "
+        "undefined")
+
+    api = (CONTROLLER / "em_api.py").read_text()
+    handler = api[api.index("async def _get_devices"):]
+    handler = handler[:handler.index("\n@")] if "\n@" in handler else handler[:400]
+    assert "_ok([" in handler, (
+        "this test assumes /api/devices returns a bare list — if that changed, "
+        "every caller in dashboard.jsx has to change with it")
+
+
 def test_emos_wpa_cli_calls_carry_the_control_socket_path():
     """
     wpa_cli defaults to /var/run/wpa_supplicant. emOS starts its supplicant
@@ -2505,27 +2608,377 @@ def test_the_emos_and_firmware_release_namespaces_cannot_select_each_other():
 
 def test_the_emos_init_is_verified_before_it_is_served():
     """
-    A release built wrong is wrong for everyone, so it is refused at the point
-    of download rather than at the point of boot. Both properties it checks
-    are silent when wrong and fatal on the device.
+    A release built wrong is wrong for everyone, so it is refused at download
+    rather than at boot. The checks live in the shared resolver: there are two
+    ways to get an init, and a check at only one is a way in that does not
+    verify.
     """
-    fn = _strip_prose(_fn_body(
-        (CONTROLLER / "em_api.py").read_text(), "_get_provision_emos_init"))
-    assert "init_binary_problems" in fn, (
-        "the init must be checked for aarch64/static before it is served")
-    assert "bad_release_asset" in fn
+    api = (CONTROLLER / "em_api.py").read_text()
+    resolver = _strip_prose(_fn_body(api, "_fetch_one_init"))
+    assert "init_binary_problems" in resolver, (
+        "the init must be checked for architecture/static before it is served")
+    assert "bad_release_asset" in resolver
+    # The architecture asked for is what it is checked against, not a constant.
+    assert "init_binary_problems(binary, arch)" in resolver, (
+        "the init must be verified against the architecture that was requested")
+
+    # Every route to an init goes through that one function, so none of them can
+    # serve an unchecked one.
+    assert "_fetch_one_init" in _strip_prose(_fn_body(api, "_fetch_emos_init")), \
+        "the download endpoint's resolver must go through _fetch_one_init"
+    assert "_fetch_one_init" in _strip_prose(_fn_body(api, "_fetch_emos_payload")), \
+        "the image endpoint's resolver must go through _fetch_one_init"
+    for name, want in (("_get_provision_emos_init", "_fetch_emos_init"),
+                       ("_post_provision_emos_image", "_fetch_emos_payload")):
+        fn = _strip_prose(_fn_body(api, name))
+        assert want in fn, f"{name} must resolve through {want}"
+
+
+def test_the_busybox_build_can_satisfy_the_gpl_obligation():
+    """
+    busybox is the only GPL-2.0 thing emOS ships, and the obligation is met by
+    publishing source ALONGSIDE the binary — not by a link, which would leave
+    compliance depending on busybox.net's server layout.
+
+    Asserted against code rather than prose: every string checked here is an
+    executable line, because a test that greps for the words would be satisfied
+    by the comment explaining them.
+    """
+    script = (CONTROLLER.parent / "emos" / "tools" / "build-busybox.sh").read_text()
+    body = "\n".join(l for l in script.splitlines()
+                     if l.strip() and not l.lstrip().startswith("#"))
+
+    # The tarball is pinned, and checked on EVERY run rather than only after a
+    # download — a cached or pre-seeded one is no less likely to be wrong.
+    assert "BB_SHA512=" in body, "the busybox source must be pinned by hash"
+    assert "sha512sum -c -" in body, "the pin must actually be checked"
+
+    # Both artifacts reach the output directory, which is what the release
+    # publishes. Without these the binary ships with no corresponding source.
+    assert '"$OUT/busybox-$BB_VER.tar.bz2"' in body, \
+        "the source tarball must be installed into the output directory"
+    assert '"$OUT/busybox-LICENSE"' in body, \
+        "the licence text must be installed into the output directory"
+
+    # And the tarball must actually BE the source of the binary. The build diffs
+    # the tree it compiled against a fresh extraction and refuses on any
+    # modified or missing upstream file — the supplicant build beside this one
+    # patches its sources with inline python, so "we do not patch busybox" has
+    # to be enforced rather than assumed.
+    assert "diff -rq" in body, \
+        "the build must prove the tree it compiled matches the published tarball"
+
+    # The release gate, which fails the publish rather than the build.
+    wf = (CONTROLLER.parent / ".github" / "workflows"
+          / "emos-release.yml").read_text()
+    assert "busybox-LICENSE" in wf and "busybox-$BB_VER.tar.bz2" in wf, \
+        "the release must verify both GPL assets exist before publishing"
 
 
 def test_the_emos_release_workflow_asserts_what_it_publishes():
     """
-    The last point before the artifact is something people flash. CI checks
-    the tip of a branch; this checks the thing being published.
+    The last point before the artifact is something people flash. CI checks a
+    branch tip; this checks what is published.
+
+    Read as YAML, not grepped: the old substring check pinned the FORMATTING of a
+    one-item list, so adding an asset broke a test with no opinion about it.
     """
-    wf = (CONTROLLER.parent / ".github" / "workflows" / "emos-release.yml").read_text()
+    import yaml
+    path = CONTROLLER.parent / ".github" / "workflows" / "emos-release.yml"
+    wf = path.read_text()
     assert "ARM aarch64" in wf, "the release must assert the init is aarch64"
-    assert "statically linked" in wf, "the release must assert the init is static"
-    assert "ringsim --check" in wf, "the release must run the ring invariants"
-    # The image is assembled on the user's side from their own boot partition,
-    # so the only thing published is the init.
-    assert "files: emos/build/init" in wf, \
-        "only the init is published — an image would carry Amazon's kernel"
+    assert "32-bit LSB executable, ARM" in wf, \
+        "the release must assert init32 is a 32-bit ARM binary"
+    assert "statically linked" in wf, "the release must assert the inits are static"
+    # All four off-target checks run against the source being published. Each
+    # one drives a parser or an invariant whose failure is silent on hardware.
+    for check in ("ringsim --check", "pwcheck", "tmoutcheck", "wpacheck",
+                  "cmdlinecheck"):
+        assert check in wf, f"the release must run {check}"
+    # The bundle is what carries everything but the compat init, so a release
+    # that skipped building it would publish an empty-handed payload.
+    assert "make-payload-bundle.py" in wf, \
+        "the release must build the payload bundle"
+    for f in ("init32", "wpa_supplicant", "wpa_cli", "em-wifi"):
+        assert f in wf, f"{f} must go into the bundle"
+
+    published = set()
+    for job in yaml.safe_load(wf)["jobs"].values():
+        for step in job["steps"]:
+            files = (step.get("with") or {}).get("files")
+            if files:
+                published |= {f.strip() for f in files.split("\n") if f.strip()}
+
+    # Pinned as an exact SET, so adding an asset is a deliberate edit here. The
+    # invariant is that we have the RIGHT to redistribute everything in it: two
+    # inits (one per kernel architecture) and emOS's own userspace, which is
+    # hostap under BSD, libnl-tiny under LGPL, busybox under GPL-2.0 and our own
+    # shell script.
+    #
+    # The two busybox-* assets are the GPL-2.0 OBLIGATION, not extras. §3(a) wants
+    # the corresponding source to accompany the binary, so the verified upstream
+    # tarball and the licence text are published beside it — a link to busybox.net
+    # would leave compliance depending on a third party's server. Dropping either
+    # ships GPL-2.0 object code with no source, which is why they are pinned here
+    # rather than left to the release step.
+    #
+    # A BOOT IMAGE MUST NEVER APPEAR. It carries the device's own kernel and
+    # DTBs, so publishing one would redistribute Amazon's code — the image is
+    # assembled on the user's side from the partition they read off their device.
+    assert published == {"emos/build/init", "emos/build/emos-payload.zip",
+                         "emos/build/bb/busybox-*.tar.bz2",
+                         "emos/build/bb/busybox-LICENSE"}, (
+        f"the published set changed — got {sorted(published)}. Everything here "
+        f"must be redistributable by us, and a boot image must never be among "
+        f"it. The loose `init` is not redundant: _fetch_latest_emos_release "
+        f"matches it by exact name, so dropping it strands every fielded "
+        f"controller. The busybox source and licence are a GPL-2.0 obligation.")
+    assert not any(".img" in f or "boot" in f.rsplit("/", 1)[-1]
+                   for f in published), (
+        "an image or boot partition must never be a release asset — it carries "
+        "the device's own kernel and DTBs")
+    # `init` keeps that exact name. The controller selects release assets by
+    # exact name, so renaming it strands every controller already in the field
+    # looking for it — which is why the second init was ADDED as `init32`
+    # rather than the pair being renamed to `init-arm64`/`init-arm`.
+    api = (CONTROLLER / "em_api.py").read_text()
+    mapping = api[api.index("EMOS_INIT_ASSETS = {"):]
+    mapping = mapping[:mapping.index("}") + 1]
+    assert '"init"' in mapping and '"init32"' in mapping, (
+        f"the arch-to-asset map must name the published assets, got: {mapping}")
+    # init32 is not a published asset any more — it travels inside the bundle,
+    # which the step check above pins.
+    assert "emos/build/init" in published, \
+        "the compat init must still be published loose"
+
+
+def test_the_init_architecture_is_decided_where_the_reference_is():
+    """
+    An init of the wrong architecture flashes fine and then produces no output at
+    all, so the decision belongs where the reference is. The wizard must not pick
+    — that needs a second copy of reference_kernel_arch in JavaScript. Shape
+    rather than behaviour, the build step having no seam to test through.
+    """
+    jsx = (CONTROLLER / "static" / "dashboard.jsx").read_text()
+    api = (CONTROLLER / "em_api.py").read_text()
+    build = _js_fn_body(jsx, "runBuildEmos")
+
+    # The wizard asks the controller to resolve it, and does not fetch one to
+    # send. Fetching would mean choosing an architecture with no reference in
+    # hand, which is the guess this whole path removes.
+    assert "use_latest_init" in build, (
+        "the wizard must ask the controller to resolve the init, so the "
+        "architecture is read off the reference rather than guessed")
+    assert "/api/provision/emos_init" not in build, (
+        "the build step must not fetch an init — that endpoint cannot know "
+        "which architecture this image needs")
+
+    # Neither the sniffer nor its magic numbers may be reimplemented here.
+    for magic in ("016f2818", "ARM\\x64", "0x24", "reference_kernel_arch"):
+        assert magic not in build, (
+            f"{magic!r} in the wizard means a second copy of the architecture "
+            f"sniffer — it lives in em_emos_build.reference_kernel_arch")
+
+    # The endpoint reads it off the reference, and refuses rather than
+    # defaulting when it cannot: an init chosen by guess is the one failure with
+    # no symptom on the device.
+    handler = _fn_body(api, "_post_provision_emos_image")
+    assert "reference_kernel_arch" in handler, (
+        "the image endpoint must read the architecture off the reference")
+    assert "unknown_reference_arch" in handler, (
+        "an unreadable reference must refuse, not fall back to an architecture")
+
+
+def test_the_wifi_tools_go_only_into_a_32_bit_image():
+    """
+    init prefers /sbin/wpa_supplicant the moment one exists, so including these
+    in a FireOS 5 image would move the whole fleet off Amazon's working
+    supplicant as a side effect of a provisioning change. Same for wpa_cli, which
+    init's nudge now prefers.
+
+    Missing them on FireOS 6 is fatal, not degraded: Amazon's aborts under emOS,
+    so the image would have no WiFi and no way to report it but a cable.
+    """
+    api = (CONTROLLER / "em_api.py").read_text()
+    fn = _strip_prose(_fn_body(api, "_fetch_emos_payload"))
+    assert "ARCH_ARM" in fn, (
+        "the WiFi tools must be gated on the reference's kernel architecture")
+    assert "no_wifi_tools_for_arch" in fn, (
+        "a 32-bit image with no WiFi tools available must refuse, not build "
+        "something with no network")
+
+    # The gate must test for the 32-bit kernel specifically. `ARCH_ARM64` is a
+    # prefix-free constant but `ARCH_ARM` is not a substring test anyone should
+    # rely on, so the comparison is pinned literally.
+    assert "arch == em_emos_build.ARCH_ARM" in fn, (
+        "the gate must be an equality against ARCH_ARM, so arm64 cannot satisfy it")
+
+    # And all three travel together: em-wifi is useless without the two binaries
+    # it drives, and wpa_cli alone would change which binary init's nudge uses.
+    assert "EMOS_SBIN_ASSETS" in fn, \
+        "the tools must come from the one list, so they cannot diverge"
+    tools = api[api.index("EMOS_SBIN_ASSETS = ("):]
+    tools = tools[:tools.index(")") + 1]
+    for name in ("wpa_supplicant", "wpa_cli", "em-wifi", "busybox"):
+        assert f'"{name}"' in tools, f"{name} missing from EMOS_SBIN_ASSETS"
+
+
+def test_a_v2_device_is_refused_by_the_fireos_flow_and_accepted_by_emos():
+    """
+    FireOS 5 does not boot on v2's bootloaders, so the FireOS flow must still
+    refuse. emOS must not — it now runs on FireOS 6's kernel, the only FireOS v2
+    boots, and its escrow-build-flash sequence is not FireOS-5-specific.
+
+    Both directions pinned: refuse in emOS and the feature is unreachable behind
+    a message blaming the device; accept in FireOS and somebody flashes a boot
+    image that cannot boot.
+    """
+    jsx = (CONTROLLER / "static" / "dashboard.jsx").read_text()
+    fn = _js_fn_body(jsx, "runConnectAndroid")
+
+    assert "unlock.v2 && !isEmos" in fn, (
+        "the hard refusal must be gated on NOT being the emOS flow — emOS "
+        "supports the FireOS 6 kernel a v2 device has")
+    # The FireOS refusal still closes the connection and writes nothing.
+    assert "setAdb(null)" in fn and "hard-bricked" in fn, (
+        "the FireOS refusal must still stop the flow and warn against flashing "
+        "bootloaders by hand")
+    # And a v2 device reaching the emOS flow is told so, loudly, while it can
+    # still be stopped — the escrow is what makes the write recoverable.
+    assert "Escrow Boot Image step is the way back" in fn, (
+        "a v2 device on the emOS flow must be told the escrow is the way back, "
+        "before anything is written")
+
+    # The release gate is flow-aware too, and names what it accepts rather than
+    # accepting everything that is not 5.x: an unexpected release is still a
+    # wrong device, which is the whole point of the check.
+    assert "isEmos ? ['5.', '7.'] : ['5.']" in fn, (
+        "the emOS flow must accept Android 5.x and 7.x (FireOS 6 is 7.1) and "
+        "the FireOS flow only 5.x")
+
+
+def test_every_debloat_push_asks_which_userspace_the_device_booted():
+    """
+    The debloat payload is Android-only — a pm-hide list and a Magisk
+    service.d script — and emOS has neither a package manager nor Magisk.
+
+    `_sync_debloat` has THREE call sites and for a while only two of them
+    asked. `reconcile_on_connect` gates on `live.android_userspace` and
+    `_post_debloat` refuses with `not_android`, but the OTA path in
+    `_run_update_locked` called it unconditionally. Found on EFF, 2026-09-07,
+    at its first OTA after being moved to emOS: the transfer targeted
+    `/sbin/.core/img/.core/service.d/` on a device with no Magisk daemon to
+    have created it.
+
+    That cost only a wasted shell round trip, because the destination
+    directory probe caught it — but the probe is the backstop, not the gate.
+    Without it this is the 240s stall measured on the same device on
+    2026-09-04, where TRANSFER_OK never arrives and the transfer holds the
+    device's shell lock for its full timeout, twice.
+
+    Asserted per call site rather than by counting, so a fourth one has to
+    answer the question too.
+    """
+    # Parsed, not grepped, so _strip_prose is neither needed nor wanted: an
+    # AST contains no comments at all, and stripping them first breaks the
+    # parse on any line whose prose was load-bearing to the syntax.
+    tree = ast.parse((CONTROLLER / "em_api.py").read_text())
+
+    def gated(node) -> bool:
+        """True when `android_userspace` is tested anywhere above this call."""
+        for anc in ancestors.get(node, ()):
+            if isinstance(anc, ast.If) and "android_userspace" in ast.dump(anc.test):
+                return True
+        return False
+
+    ancestors: dict = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            ancestors[child] = (parent,) + ancestors.get(parent, ())
+
+    calls = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "_sync_debloat"
+    ]
+    assert len(calls) >= 3, (
+        f"expected at least three _sync_debloat call sites, found {len(calls)} — "
+        "if one was removed, update this test rather than deleting it"
+    )
+
+    ungated = [n.lineno for n in calls if not gated(n)]
+    # _post_debloat guards by returning `not_android` BEFORE reaching the call,
+    # so its call site has no enclosing `if` and is exempt by name.
+    enclosing = {
+        n.lineno: next(
+            (a.name for a in ancestors.get(n, ())
+             if isinstance(a, (ast.AsyncFunctionDef, ast.FunctionDef))),
+            "?",
+        )
+        for n in calls
+    }
+    ungated = [ln for ln in ungated if enclosing[ln] != "_post_debloat"]
+    assert not ungated, (
+        "these _sync_debloat call sites do not check android_userspace: "
+        + ", ".join(f"line {ln} in {enclosing[ln]}()" for ln in ungated)
+        + " — an emOS device has no package manager to hide packages from and "
+          "no Magisk daemon to have created the service.d directory."
+    )
+
+
+def test_the_bundle_stamp_has_exactly_one_definition():
+    """
+    A stale-tab check is worthless if the two ends derive the stamp
+    separately.
+
+    `_serve_dashboard` stamps the bundle URL and `/api/system/status`
+    publishes the same value for a running page to compare against. If those
+    two ever compute it independently they can drift, and the failure is
+    silent in both directions: permanently stale (a reload prompt nobody can
+    satisfy) or permanently fresh (the check does nothing, which is the state
+    this replaced).
+
+    The bug it exists for: a tab open across a controller update keeps its old
+    JavaScript, the wizard silently ran a step that had shipped hours earlier,
+    and the version in the header named the NEW controller because it comes
+    from the API — so the one number somebody checks to rule this out was the
+    number lying to them (2026-09-10).
+    """
+    src = (Path(__file__).resolve().parent.parent / "em_api.py").read_text()
+
+    assert src.count("def _bundle_version(") == 1, (
+        "_bundle_version must be the single definition of the bundle stamp")
+    assert '"bundle_version": _bundle_version()' in src, (
+        "/api/system/status must publish the stamp via _bundle_version(), so "
+        "the page can compare what it loaded against what is being served")
+
+    # The URL stamp must come from the same call, not a second stat().
+    serve = src[src.index("async def _serve_dashboard"):]
+    serve = serve[:serve.index("async def _redirect_root")]
+    assert "_bundle_version()" in serve, (
+        "_serve_dashboard must stamp the URL from _bundle_version() rather "
+        "than re-deriving the mtime")
+    assert "st_mtime" not in serve, (
+        "_serve_dashboard re-derives the bundle mtime — that is the drift "
+        "this test exists to prevent; use _bundle_version()")
+
+
+def test_the_stale_bundle_check_does_not_refresh_the_displayed_version():
+    """
+    The header must keep naming the controller the page was LOADED against.
+
+    Calling setStatus from the staleness poll would show the new version
+    beside a reload prompt, which reads as a bug in the prompt rather than a
+    stale page — and it is exactly the misleading behaviour being fixed, just
+    arrived at from the other side.
+    """
+    jsx = (Path(__file__).resolve().parent.parent
+           / "static" / "dashboard.jsx").read_text()
+
+    start = jsx.index("const stale = setInterval(")
+    block = jsx[start:jsx.index("return () => {", start)]
+    assert "bundle_version" in block, "the staleness poll must compare bundle_version"
+    assert "setStatus" not in block, (
+        "the staleness poll must not call setStatus — the header's version "
+        "has to keep naming the controller this page was loaded against")

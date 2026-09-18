@@ -22,6 +22,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <net/if.h>
+#include <netinet/in.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -34,7 +36,9 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <stdint.h>
+#include <sys/syscall.h>
 #include <sys/sysmacros.h>
+#include <linux/reboot.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
@@ -805,6 +809,37 @@ static void write_state(int n)
     close(fd);
 }
 
+/* Reboot into a named boot mode — "recovery" gets you TWRP.
+ *
+ * This is the whole of what `adb reboot recovery` does: one syscall carrying a
+ * mode string, which MediaTek's restart handler turns into the value LK reads
+ * on the next boot. No property service, no ueventd, no by-name symlinks, no
+ * BCB write into the misc partition.
+ *
+ * It has to be done here because **Amazon's /system/bin/reboot cannot reboot an
+ * emOS device at all** — not merely for recovery, but with no argument either.
+ * It reaches Android's property service over /dev/socket/property_service,
+ * which nothing here runs, so every mode fails with ENOENT. That is a confusing
+ * error to meet at a console, because it names a missing file and the file it
+ * means is a socket that was never going to exist. Measured on hardware
+ * 2026-09-10, along with the confirmation that the kernel accepts the string
+ * and LK acts on it.
+ *
+ * bionic's reboot(2) wrapper takes no argument, so it cannot express a mode.
+ * The raw syscall can, which is why this is syscall() rather than reboot().
+ *
+ * Returns only when the kernel refused; there is nothing useful to do then but
+ * say so, since the caller is a person at a serial console.
+ */
+static int reboot_into(const char *mode)
+{
+    sync();
+    sync();
+    syscall(__NR_reboot, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2,
+            LINUX_REBOOT_CMD_RESTART2, mode);
+    return -1;
+}
+
 /* Write the known-good image back over the boot partition and reboot into it. */
 static void restore_good(void)
 {
@@ -930,16 +965,170 @@ static int wr(const char *path, const char *val)
     return n > 0 ? 0 : -1;
 }
 
-/* The device's serial, read from androidboot.serialno on the kernel cmdline.
+/* ── Which /system this image was built against ───────────────────────────
  *
- * LK puts it there (confirmed in /proc/cmdline on this board), which is the
- * only source available to us: there is no property service under emOS, so
- * getprop ro.serialno does not exist, and /system carries the BUILD's identity
- * rather than this unit's.
+ * `emos.system=` is stamped onto the cmdline by the packer at BUILD time and
+ * names the partition holding the FireOS userspace this image was built from.
  *
- * Returns a pointer to a static buffer, empty if it could not be read. Callers
- * must treat empty as "unknown" and carry on — nothing here is worth failing a
- * boot over.
+ * It is a build-time fact on purpose. emOS carries Amazon's kernel and its own
+ * ramdisk, and nothing else: bionic, the linker, tinyalsa, /system/bin/sh and
+ * the WiFi firmware all come from /system at runtime, which is 768MB of
+ * Amazon's code we neither ship nor could. So an image is a PAIR -- a kernel
+ * and the system it was taken beside -- and the pairing has to travel with the
+ * image rather than be guessed at each boot.
+ *
+ * Do NOT derive this from the boot slot. Once emOS is installed beside a
+ * preserved stock image the two are DELIBERATELY different: stock keeps its
+ * slot, emOS goes in the other, and the bootloader is pointed at emOS. The
+ * slot says where these bytes live; it says nothing about which userspace they
+ * were built against.
+ *
+ * Absent means an image built before this existed: fall back to p13, which is
+ * what those images hardcoded, so they keep booting exactly as they did.
+ */
+#define SYSTEM_PART_DEFAULT 13
+
+/* The value of `key` on the cmdline, copied into `out`. NULL when absent.
+ *
+ * Matched at a TOKEN BOUNDARY, unlike the strstr() below: a bare substring
+ * search for "emos.system=" is also satisfied by "xemos.system=", and the
+ * value it would then return belongs to a parameter we know nothing about.
+ * Mounting the wrong partition on the strength of that is not a failure
+ * anybody could read off the symptom.
+ */
+static const char *cmdline_value(const char *cmdline, const char *key,
+                                 char *out, size_t outlen)
+{
+    size_t klen = strlen(key);
+    for (const char *p = cmdline; *p; ) {
+        while (*p == ' ' || *p == '\t' || *p == '\n')
+            p++;
+        if (!*p)
+            break;
+        const char *end = p;
+        while (*end && *end != ' ' && *end != '\t' && *end != '\n')
+            end++;
+        if ((size_t)(end - p) > klen && !strncmp(p, key, klen)) {
+            size_t vlen = (size_t)(end - p) - klen;
+            if (vlen >= outlen)
+                return NULL;              /* too long to be one of ours */
+            memcpy(out, p + klen, vlen);
+            out[vlen] = 0;
+            return out;
+        }
+        p = end;
+    }
+    return NULL;
+}
+
+/* The mmcblk0 partition minor named by emos.system=, or SYSTEM_PART_DEFAULT.
+ *
+ * The value is a full device path rather than a bare number so it reads as
+ * what it is in a header dump and in /proc/cmdline -- this is the one field
+ * somebody supporting a device will be asked to read out loud.
+ *
+ * Anything that is not exactly /dev/block/mmcblk0p<N> falls back rather than
+ * being interpreted generously. A stamp we do not recognise means the image
+ * was built by something we do not know, and guessing at its intent is how a
+ * wrong partition gets mounted and reported as a healthy boot.
+ */
+static int cmdline_system_part(const char *cmdline)
+{
+    char val[64];
+    if (!cmdline_value(cmdline, "emos.system=", val, sizeof val))
+        return SYSTEM_PART_DEFAULT;
+
+    static const char pfx[] = "/dev/block/mmcblk0p";
+    size_t plen = sizeof pfx - 1;
+    if (strncmp(val, pfx, plen))
+        return SYSTEM_PART_DEFAULT;
+
+    const char *d = val + plen;
+    if (!*d)
+        return SYSTEM_PART_DEFAULT;
+    int n = 0;
+    for (; *d; d++) {
+        if (*d < '0' || *d > '9')
+            return SYSTEM_PART_DEFAULT;
+        n = n * 10 + (*d - '0');
+        if (n > 127)                      /* minor 0 is the whole device */
+            return SYSTEM_PART_DEFAULT;
+    }
+    return n > 0 ? n : SYSTEM_PART_DEFAULT;
+}
+
+/* Copy a serial out of `raw` into `out`, trimmed and validated.
+ *
+ * Stops at the first space, newline or NUL, and REJECTS anything that is not
+ * printable ASCII by returning an empty string. The serial is the identity the
+ * whole fleet is keyed on, so a plausible but corrupt one is worse than none —
+ * "unknown" at least says it does not know, while a mangled value quietly
+ * becomes a second device.
+ *
+ * Returns 1 when it wrote a usable serial, 0 otherwise.
+ */
+static int serial_copy(const char *raw, char *out, size_t outsz)
+{
+    size_t i = 0;
+    out[0] = 0;
+    if (!raw)
+        return 0;
+    while (raw[i] && raw[i] != ' ' && raw[i] != '\n' && raw[i] != '\r'
+           && i < outsz - 1) {
+        /* Clear on rejection. Leaving the bytes copied so far would hand the
+         * caller a truncated serial, or -- if its buffer is stack memory a
+         * previous call used -- a stale one that looks entirely valid. Caught
+         * exactly that way by serialcheck.c. */
+        if (raw[i] < 0x21 || raw[i] > 0x7e) {
+            out[0] = 0;
+            return 0;
+        }
+        out[i] = raw[i];
+        i++;
+    }
+    out[i] = 0;
+    return i > 0;
+}
+
+/* Find androidboot.serialno= on a kernel cmdline. Empty if it is not there.
+ *
+ * The key must start the line or follow a space, so a longer argument merely
+ * ENDING in ours cannot answer -- the same match rule cmdline_system_part()
+ * applies to emos.system=.
+ */
+static int serial_from_cmdline(const char *line, char *out, size_t outsz)
+{
+    const char *key = "androidboot.serialno=";
+    const char *p = line;
+    out[0] = 0;
+    if (!line)
+        return 0;
+    while ((p = strstr(p, key))) {
+        if (p == line || p[-1] == ' ')
+            return serial_copy(p + strlen(key), out, outsz);
+        p += strlen(key);
+    }
+    return 0;
+}
+
+/* The device's serial.
+ *
+ * TWO sources, and idme leads because the cmdline is not reliably there to be
+ * read. /proc/idme/serial is Amazon's ID Manager, exported by their kernel
+ * driver and world-readable — the hardware value, needing no property service
+ * and no bootloader argument. Verified 2026-09-15 on a v1 (FireOS 5, matching
+ * getprop exactly) and a v2 (FireOS 6, in recovery).
+ *
+ * The cmdline stays as a fallback, and it is the one that failed: on FireOS 6
+ * the kernel is 32-bit, so COMMAND_LINE_SIZE is 1024, and our image cmdline is
+ * 385 bytes against stock's 70. That pushes androidboot.serialno — near the end
+ * of what LK appends — to byte 1040, where it is truncated away before the
+ * kernel sees it. The parse was always correct; there was nothing to find.
+ * Measured on the spare, 2026-09-15.
+ *
+ * Returns a pointer to a static buffer, empty if neither source answered.
+ * Callers must treat empty as "unknown" and carry on — nothing here is worth
+ * failing a boot over.
  */
 static const char *serialno(void)
 {
@@ -949,27 +1138,27 @@ static const char *serialno(void)
         return buf;
     done = 1;
 
-    int fd = open("/proc/cmdline", O_RDONLY);
+    char raw[2048];
+    int fd = open("/proc/idme/serial", O_RDONLY);
+    if (fd >= 0) {
+        ssize_t n = read(fd, raw, sizeof raw - 1);
+        close(fd);
+        if (n > 0) {
+            raw[n] = 0;
+            if (serial_copy(raw, buf, sizeof buf))
+                return buf;
+        }
+    }
+
+    fd = open("/proc/cmdline", O_RDONLY);
     if (fd < 0)
         return buf;
-    char line[2048];
-    ssize_t n = read(fd, line, sizeof line - 1);
+    ssize_t n = read(fd, raw, sizeof raw - 1);
     close(fd);
     if (n <= 0)
         return buf;
-    line[n] = 0;
-
-    const char *key = "androidboot.serialno=";
-    char *p = strstr(line, key);
-    if (!p)
-        return buf;
-    p += strlen(key);
-    size_t i = 0;
-    while (p[i] && p[i] != ' ' && p[i] != '\n' && i < sizeof buf - 1) {
-        buf[i] = p[i];
-        i++;
-    }
-    buf[i] = 0;
+    raw[n] = 0;
+    serial_from_cmdline(raw, buf, sizeof buf);
     return buf;
 }
 
@@ -981,11 +1170,43 @@ static void usbwr(const char *leaf, const char *val)
     note("usb %s=%s rc=%d errno=%d\n", leaf, val, r, r ? errno : 0);
 }
 
-#define NETLOG "/data/local/tmp/net.log"
+/* The network log lives in RAM, not on the eMMC.
+ *
+ * It was on /data, appended with no bound — and it is not only netlog()'s own
+ * lines: spawn() points every child's stdout and stderr here, so wmt_loader,
+ * wpa_supplicant, dhcpcd, ntpd and the five-second wpa_cli nudge all write to
+ * it. A device that cannot join its network — wrong password, AP replaced,
+ * moved house — therefore wrote to flash every five seconds for ever, in
+ * exactly the failure state where nobody is watching. Measured 2026-09-06 on a
+ * device stuck at stage 11.
+ *
+ * /run is a 4MB tmpfs mounted for precisely this ("routine logging never
+ * touches the eMMC", below). The cost is that the log does not survive a
+ * reboot, which is the right trade: it answers "why is the network not up
+ * NOW", read over the console while the device is still running, and a crash
+ * that spans a reboot is what the last_kmsg copies are for.
+ *
+ * Capped and rotated, because filling a tmpfs is its own failure. */
+#define NETLOG     "/run/net.log"
+#define NETLOG_CAP (128 * 1024)
 
 /* The WiFi stage runs in a forked child, so it must NOT use note(): fork copies
  * the trail buffer, and both halves would then pwrite divergent contents to the
  * same offset on the cache partition. /data is mounted by the time this runs. */
+/* Open the network log for append, rotating first if it has outgrown the cap.
+ *
+ * One generation, so the worst case is two caps plus whatever a long-lived
+ * child keeps writing through an fd it opened before the rotation — ordinary
+ * log-rotation behaviour, and bounded in practice because the daemons here
+ * write on state changes rather than continuously. */
+static int netlog_open(void)
+{
+    struct stat st;
+    if (stat(NETLOG, &st) == 0 && st.st_size >= NETLOG_CAP)
+        rename(NETLOG, NETLOG ".1");
+    return open(NETLOG, O_WRONLY | O_CREAT | O_APPEND, 0644);
+}
+
 static void netlog(const char *fmt, ...)
 {
     char line[256];
@@ -999,11 +1220,59 @@ static void netlog(const char *fmt, ...)
     if (n <= 0)
         return;
     n += p;
-    int fd = open(NETLOG, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    int fd = netlog_open();
     if (fd < 0)
         return;
     write(fd, line, n > (int)sizeof line - 1 ? (int)sizeof line - 1 : n);
     close(fd);
+}
+
+/* The first of `cands` that exists and is executable, or NULL.
+ *
+ * FireOS 5 and FireOS 6 put the same tools in different places: WiFi bring-up
+ * moved to /system/vendor, 6620_launcher became wmt_launcher, and a FireOS 6
+ * /system ships no busybox at all, only toybox. Resolving by what is present
+ * keeps one init for both kernels rather than two that drift — the same
+ * "resolve by name, not by number" rule the rest of the project follows.
+ */
+static const char *first_exec(const char *const cands[])
+{
+    for (int i = 0; cands[i]; i++)
+        if (access(cands[i], X_OK) == 0)
+            return cands[i];
+    return NULL;
+}
+
+/* busybox. OURS FIRST, on every layout. NULL when the image carries none, and
+ * every caller then falls back as it always did, so an old image behaves
+ * exactly as before rather than losing the network outright. Only meaningful
+ * once /system and /data are mounted.
+ *
+ * The ordering is the point. Every other candidate here belongs to somebody
+ * else: /system's copy is Amazon's on FireOS 5 and does not exist on FireOS 6,
+ * and /data/local/bin is where a third-party root leaves one -- amonet v2's
+ * OPTIONAL component, or a root zip from the XDA thread. Searching those first
+ * means DHCP, ntpd and the system log are served by a binary of unknown
+ * vintage that the user can remove by reflashing, and nothing reports the
+ * swap. That is precisely how #524 happened: FireOS 6 appeared to work because
+ * amonet had left a busybox behind, and the first clean install had no udhcpc
+ * at all.
+ *
+ * So the answer is not "prefer ours where theirs is missing" but "use ours,
+ * full stop". It is the one we build, pin, and test: 1.38.0, static, and
+ * verified on hardware to bring up DHCP, the log and ~300 applets.
+ *
+ * This DOES change FireOS 5, which has run on Amazon's copy until now, and
+ * that is deliberate rather than incidental. It is not a change under a
+ * running device: a device only gets ours by being flashed with an image that
+ * carries it, which is the same act that delivers the rest of the release.
+ */
+static const char *busybox_path(void)
+{
+    static const char *const c[] = { "/sbin/busybox", "/system/bin/busybox",
+                                     "/system/xbin/busybox",
+                                     "/data/local/bin/busybox", NULL };
+    return first_exec(c);
 }
 
 /* fork+exec, returning the pid. NULL-terminated argv, argv[0] is the path. */
@@ -1011,9 +1280,12 @@ static pid_t spawn(char *const argv[])
 {
     pid_t pid = fork();
     if (pid == 0) {
-        char *envp[] = { "HOME=/", "ANDROID_ROOT=/system",
+        /* ANDROID_DATA: see start_console(). Services inherit this too, so
+         * without it the tzdata warning lands in the log rather than on a
+         * terminal, two lines per exec. */
+        char *envp[] = { "HOME=/", "ANDROID_ROOT=/system", "ANDROID_DATA=/data",
                          "PATH=/sbin:/system/bin:/system/xbin", NULL };
-        int n = open(NETLOG, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        int n = netlog_open();
         if (n < 0)
             n = open("/dev/null", O_RDWR);
         if (n >= 0) { dup2(n, 1); dup2(n, 2); if (n > 2) close(n); }
@@ -1194,22 +1466,391 @@ static int ifup(const char *name)
  * Writing "1" to /dev/wmtWifi blocks for ~13s while the chip is powered and the
  * firmware loaded, which is why this runs in its own process.
  */
+/* The combo chip, brought up without Amazon's wmt_loader and wmt_launcher.
+ *
+ * On FireOS 6 those two do not work in emOS's environment: wmt_loader exits
+ * 255, wmt_launcher runs but sits silent, WMT_OPID_HIF_CONF is never posted,
+ * the chip never powers on, and the /dev/wmtWifi write returns EIO. They
+ * coordinate through Android properties, and emOS has no property service --
+ * but building one to satisfy them would make Amazon's userspace MORE
+ * load-bearing, which is the wrong direction. So init talks to the kernel
+ * driver itself.
+ *
+ * Everything here comes from MediaTek's GPL source (the conn_soc variant,
+ * which is what this kernel is built from) and every number below was checked
+ * against the running driver on hardware, 2026-09-12.
+ *
+ * Two steps, and the second is the whole reason Amazon ships a launcher:
+ *
+ *   1. SET_PATCH_NAME then SET_STP_MODE. The SET_STP_MODE handler calls
+ *      wmt_lib_set_hif() and posts WMT_OPID_HIF_CONF -- the "WMT HIF info
+ *      added" line. Its argument is (fm << 4) | stp. A value it does not
+ *      recognise is rejected by wmt_lib_set_hif with no hardware touched, so
+ *      getting it wrong fails safe.
+ *
+ *   2. A daemon loop. Powering the chip makes the driver ask USERSPACE to
+ *      locate the firmware patches: it posts the string "srh_patch" and
+ *      blocks. The answer is SET_PATCH_NUM, then one SET_PATCH_INFO per
+ *      patch, then "ok" written back to release it. The driver does not care
+ *      who answers -- there is no registration of any kind -- so init answers.
+ *      Without this, power-on dies at "patch info perpare fail" and there is
+ *      no wlan0.
+ */
+#define WMT_IOC_MAGIC             0xa0
+#define WMT_IOCTL_SET_PATCH_NAME  _IOW(WMT_IOC_MAGIC, 4, char *)
+#define WMT_IOCTL_SET_STP_MODE    _IOW(WMT_IOC_MAGIC, 5, int)
+#define WMT_IOCTL_SET_PATCH_NUM   _IOW(WMT_IOC_MAGIC, 14, int)
+#define WMT_IOCTL_SET_PATCH_INFO  _IOW(WMT_IOC_MAGIC, 15, char *)
+
+/* wmt_dev.h: STP_UART_FULL 1, STP_UART_MAND 2, STP_BTIF_FULL 3, STP_SDIO 4.
+ * wmt_core.h: WMT_FM_I2C 1, WMT_FM_COMM 2.
+ * biscuit is BTIF -- the driver reports back "hifType 2" for this value. */
+#define WMT_STP_BTIF_FULL 0x3
+#define WMT_FM_COMM       0x2
+#define WMT_HIF_ARG       ((WMT_FM_COMM << 4) | WMT_STP_BTIF_FULL)
+
+#define WMT_PATCH_MAX 8
+
+/* WMT_PATCH_INFO, wmt_lib.h. The layout is fixed by the driver's
+ * copy_from_user, so the field order and the 256-byte name are not ours to
+ * choose. */
+struct wmt_patch_info {
+    uint32_t seq;
+    uint8_t  addr[4];
+    uint8_t  name[256];
+};
+
+/* The four address bytes the driver splices into WMT_PATCH_P_ADDRESS_CMD.
+ *
+ * Taken from Amazon's own wmt_launcher, observed live under an LD_PRELOAD
+ * ioctl shim on a rooted FireOS 6 (2026-09-12) rather than guessed: it sends
+ * 00 00 06 00 for ROMv2_lm_patch_1_0_hdr.bin and 00 00 0e f0 for
+ * ROMv2_lm_patch_1_1_hdr.bin. The two live bytes are at header offset 0x1A
+ * and the top two are ZERO -- 0x18 is the tail of ucPLat in the 28-byte
+ * WMT_PATCH header (ucDateTime[16], u2HwVer, u2SwVer, u4PatchVer, ucPLat[4]),
+ * and sending all four from 0x18 puts rubbish in the high half. */
+#define WMT_PATCH_ADDR_OFF 0x1A
+
+static int wmt_patch_addr(const char *path, uint8_t out[4])
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return -1;
+    uint8_t hdr[WMT_PATCH_ADDR_OFF + 2];
+    ssize_t n = read(fd, hdr, sizeof hdr);
+    close(fd);
+    if (n < (ssize_t)sizeof hdr)
+        return -1;
+    out[0] = 0;
+    out[1] = 0;
+    out[2] = hdr[WMT_PATCH_ADDR_OFF];
+    out[3] = hdr[WMT_PATCH_ADDR_OFF + 1];
+    return 0;
+}
+
+/* Answer one "srh_patch". Returns the number of patches reported. */
+static int wmt_answer_patches(int fd, const char *dir)
+{
+    char names[WMT_PATCH_MAX][256];
+    int n = 0;
+    DIR *d = opendir(dir);
+    struct dirent *de;
+
+    if (!d)
+        return 0;
+    while (n < WMT_PATCH_MAX && (de = readdir(d))) {
+        size_t l = strlen(de->d_name);
+        /* The ROM patches are the *_hdr.bin files; WIFI_RAM_CODE_* and the
+         * .cfg in the same directory are not patches and must not be
+         * counted, or the driver waits for a download that never comes. */
+        if (l > 8 && !strcmp(de->d_name + l - 8, "_hdr.bin"))
+            snprintf(names[n++], sizeof names[0], "%s", de->d_name);
+    }
+    closedir(d);
+    if (!n)
+        return 0;
+
+    /* Download order is the driver's `dowloadSeq`, 1-based. The files sort
+     * into it by name (…_1_0_hdr, …_1_1_hdr), so sort rather than trust
+     * readdir, whose order is the filesystem's and not stable. */
+    for (int i = 0; i < n; i++)
+        for (int j = i + 1; j < n; j++)
+            if (strcmp(names[j], names[i]) < 0) {
+                char t[256];
+                memcpy(t, names[i], sizeof t);
+                memcpy(names[i], names[j], sizeof t);
+                memcpy(names[j], t, sizeof t);
+            }
+
+    if (ioctl(fd, WMT_IOCTL_SET_PATCH_NUM, n) < 0) {
+        netlog("wmt: SET_PATCH_NUM(%d) failed errno=%d\n", n, errno);
+        return 0;
+    }
+    for (int i = 0; i < n; i++) {
+        struct wmt_patch_info pi;
+        char full[512];
+
+        memset(&pi, 0, sizeof pi);
+        /* Download order runs BACKWARDS through the sorted names: Amazon's
+         * launcher gives ROMv2_lm_patch_1_0 seq 2 and ..._1_1 seq 1, so the
+         * higher-numbered file is downloaded first. Observed live; assigning
+         * 1,2 in name order sends them in the wrong order. */
+        pi.seq = n - i;
+        snprintf(full, sizeof full, "%s%s", dir, names[i]);
+        if (wmt_patch_addr(full, pi.addr))
+            netlog("wmt: no header address in %s\n", names[i]);
+        /* FULL PATH, not a bare name. wmt_dev_patch_get does not use
+         * request_firmware -- it filp_open()s this string exactly as given,
+         * from kernel context, so a bare name is opened relative to / and
+         * fails with "load file (…) fail, iRet(-1)". SET_PATCH_NAME does not
+         * get prepended for us. */
+        snprintf((char *)pi.name, sizeof pi.name, "%s", full);
+        if (ioctl(fd, WMT_IOCTL_SET_PATCH_INFO, &pi) < 0)
+            netlog("wmt: SET_PATCH_INFO(%d,%s) failed errno=%d\n",
+                   pi.seq, names[i], errno);
+    }
+    return n;
+}
+
+/* Stand in for wmt_launcher for as long as the chip is up.
+ *
+ * Never returns. The driver blocks its power-on inside wmt_ctrl_ul_cmd until
+ * this answers, so the loop has to outlive the bring-up rather than run once:
+ * a chip reset asks again. */
+static void wmt_daemon(int fd, const char *dir)
+{
+    for (;;) {
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        if (poll(&pfd, 1, -1) < 0) {
+            if (errno == EINTR)
+                continue;
+            netlog("wmt: poll failed errno=%d\n", errno);
+            return;
+        }
+        char cmd[64] = { 0 };
+        ssize_t n = read(fd, cmd, sizeof cmd - 1);
+        if (n <= 0)
+            continue;
+        cmd[n] = '\0';
+        if (!strncmp(cmd, "srh_patch", 9)) {
+            int got = wmt_answer_patches(fd, dir);
+            netlog("wmt: srh_patch -> %d patch(es)\n", got);
+            /* Anything but "ok" is read as failure by the driver, so say ok
+             * only when we actually found something. */
+            if (write(fd, got ? "ok" : "fail", got ? 2 : 4) < 0)
+                netlog("wmt: reply failed errno=%d\n", errno);
+        } else {
+            netlog("wmt: unhandled daemon cmd '%s'\n", cmd);
+            if (write(fd, "fail", 4) < 0)
+                netlog("wmt: reply failed errno=%d\n", errno);
+        }
+    }
+}
+
+/* Configure the HIF and fork the daemon. Returns 0 when the HIF took. */
+static int wmt_bringup(const char *patch_dir)
+{
+    int fd = open("/dev/stpwmt", O_RDWR);
+    if (fd < 0) {
+        netlog("wmt: open /dev/stpwmt failed errno=%d\n", errno);
+        return -1;
+    }
+    if (ioctl(fd, WMT_IOCTL_SET_PATCH_NAME, patch_dir) < 0)
+        netlog("wmt: SET_PATCH_NAME failed errno=%d\n", errno);
+
+    int r = ioctl(fd, WMT_IOCTL_SET_STP_MODE, WMT_HIF_ARG);
+    netlog("wmt: SET_STP_MODE(0x%x) rc=%d errno=%d\n",
+           WMT_HIF_ARG, r, r ? errno : 0);
+    if (r < 0) {
+        close(fd);
+        return -1;
+    }
+
+    pid_t p = fork();
+    if (p == 0) {
+        wmt_daemon(fd, patch_dir);
+        _exit(0);
+    }
+    /* The parent keeps its own copy closed: the daemon owns the fd, and the
+     * driver's command state is per-open. */
+    close(fd);
+    return p > 0 ? 0 : -1;
+}
+
+/* Where the WiFi credentials come from, and why it is NOT Android's file.
+ *
+ * /data survives a boot-partition write and is shared with whatever else the
+ * device can boot. Boot FireOS 6 from the other slot and Amazon's supplicant
+ * rewrites /data/misc/wifi/wpa_supplicant.conf with fields our build rejects
+ * (p2p_no_group_iface, max_oper_chwidth) -- and ONE unparsable field discards
+ * the WHOLE network block, so the device returns to emOS with no WiFi and no
+ * way to report it except over a cable. Same lesson as console.pw: anything
+ * on /data belongs to whoever wrote it last, not to us.
+ *
+ * emOS therefore keeps its own file in a namespace nothing else writes, and
+ * falls back to Android's only when it has none of its own -- which is a
+ * device that crossed over from a FireOS install and has not been told its
+ * network yet. */
+#define EMOS_WPA_CONF    "/data/emos/wpa.conf"
+#define ANDROID_WPA_CONF "/data/misc/wifi/wpa_supplicant.conf"
+
+static const char *wpa_conf(void)
+{
+    if (access(EMOS_WPA_CONF, R_OK) == 0)
+        return EMOS_WPA_CONF;
+    if (access(ANDROID_WPA_CONF, R_OK) == 0)
+        return ANDROID_WPA_CONF;
+    return NULL;
+}
+
+/* The control socket directory is declared INSIDE the conf, so it cannot be a
+ * constant: em-wifi declares /data/emos/sockets and a wizard-provisioned device
+ * Android's, and wpa_conf() prefers ours the moment it exists.
+ *
+ * Getting it wrong is silent -- the only caller is the reassociate nudge below,
+ * and without that the supplicant sat at DISCONNECTED for three minutes instead
+ * of associating in ten seconds. Default is Android's, what every earlier conf
+ * declared. */
+#define WPA_CTRL_DEFAULT "/data/misc/wifi/sockets"
+
+static void wpa_ctrl_dir(const char *conf, char *out, size_t n)
+{
+    snprintf(out, n, "%s", WPA_CTRL_DEFAULT);
+    int fd = open(conf, O_RDONLY);
+    if (fd < 0)
+        return;
+    char b[4096];
+    int r = (int)read(fd, b, sizeof b - 1);
+    close(fd);
+    if (r <= 0)
+        return;
+    b[r] = 0;
+    /* Last declaration wins, as in hostap: wpa_config_process_global is called
+     * per line and overwrites. */
+    for (char *p = b; p; ) {
+        char *line = p;
+        char *nl = strchr(p, '\n');
+        p = nl ? nl + 1 : NULL;
+        if (nl)
+            *nl = 0;
+        while (*line == ' ' || *line == '\t')
+            line++;
+        if (strncmp(line, "ctrl_interface=", 15) != 0)
+            continue;
+        char *v = line + 15;
+        /* Amazon's uses "DIR=/path GROUP=wifi"; ours a bare path. */
+        if (strncmp(v, "DIR=", 4) == 0)
+            v += 4;
+        char *sp = strpbrk(v, " \t");
+        if (sp)
+            *sp = 0;
+        /* Relative means an abstract namespace, which wpa_cli -p cannot
+         * address. */
+        if (*v == '/')
+            snprintf(out, n, "%s", v);
+    }
+}
+
+#define UDHCPC_SCRIPT "/tmp/udhcpc.sh"
+
+/* 24 turns of a 5s loop = two minutes. */
+#define WIFI_FAIL_TURNS 24
+
 static void net_main(void)
 {
-    char *loader[] = { "/system/bin/wmt_loader", NULL };
-    char *launch[] = { "/system/bin/6620_launcher", "-p",
-                       "/system/etc/firmware/", NULL };
-    char *supp[]   = { "/system/bin/wpa_supplicant", "-iwlan0", "-Dnl80211",
-                       "-c/data/misc/wifi/wpa_supplicant.conf",
-                       "-e/data/misc/wifi/entropy.bin", NULL };
-    char *dhcp[]   = { "/system/bin/dhcpcd", "-ABK", "-f",
-                       "/system/etc/dhcpcd/dhcpcd.conf", "wlan0", NULL };
+    /* FireOS 6 moved the combo-chip tools under /system/vendor and renamed
+     * the launcher; its own init.connectivity.rc runs
+     * `wmt_launcher -p /vendor/firmware/`, which is where its kernel's
+     * compiled-in firmware path points too. Same sequence, other paths. */
+    static const char *const loaders[] = { "/system/bin/wmt_loader",
+                                           "/system/vendor/bin/wmt_loader", NULL };
+    const char *ldr = first_exec(loaders);
+    int vendor = access("/system/bin/6620_launcher", X_OK) != 0
+              && access("/system/vendor/bin/wmt_launcher", X_OK) == 0;
+    char *loader[] = { (char *)(ldr ? ldr : loaders[0]), NULL };
+    char *launch[] = { vendor ? "/system/vendor/bin/wmt_launcher"
+                              : "/system/bin/6620_launcher", "-p",
+                       vendor ? "/system/vendor/firmware/"
+                              : "/system/etc/firmware/", NULL };
+    /* Prefer emOS's own supplicant when the image carries one.
+     *
+     * FireOS 6's /system/bin/wpa_supplicant cannot be used here at all: it is
+     * linked against Android IPC and aborts before main() when /dev/binder is
+     * absent, which it is under emOS. Ours is hostap 2.10 built static for
+     * ARM32 with nl80211 and internal crypto (emos/tools/build-wpa-
+     * supplicant.sh), so it needs nothing from Android.
+     *
+     * The fallback is deliberate rather than tidy: a FireOS 5 image built
+     * without the binary keeps using Amazon's, which works on the fleet today
+     * and should not be swapped for something untested by a build-time
+     * default. Drop the binary in and it is preferred; leave it out and
+     * nothing changes. */
+    const char *bbp = busybox_path();
+    if (!bbp)
+        bbp = "/system/bin/busybox";
+    static const char *const supps[] = { "/sbin/wpa_supplicant",
+                                         "/system/bin/wpa_supplicant", NULL };
+    const char *sup = first_exec(supps);
+    netlog("wifi tools: %s layout, loader %s, supplicant %s\n",
+           vendor ? "vendor (FireOS 6)" : "system (FireOS 5)", loader[0],
+           sup ? sup : supps[1]);
+    char cflag[160] = "-c" ANDROID_WPA_CONF;
+    char *supp[]   = { (char *)(sup ? sup : supps[1]), "-iwlan0", "-Dnl80211",
+                       cflag, "-e/data/misc/wifi/entropy.bin", NULL };
+    /* DHCP: Amazon's dhcpcd on FireOS 5, busybox udhcpc on FireOS 6.
+     *
+     * FireOS 6's /system/bin/dhcpcd aborts under emOS for the same reason its
+     * wpa_supplicant does -- Android IPC it cannot reach -- so on that layout
+     * it is not an option at all. busybox udhcpc needs a script to do anything
+     * with a lease it gets, which is written below; without one it obtains an
+     * address and discards it, which reads as a DHCP failure and is not.
+     *
+     * FireOS 5 keeps dhcpcd: it works on the fleet today. */
+    /* Sized generously: the busybox path is itself up to ~40 bytes and appears
+     * twice, and snprintf truncates SILENTLY -- a short buffer here cost a
+     * boot with an address but no default route, because the line that adds
+     * it was cut in half. */
+    char udhcpc_script[512];
+    snprintf(udhcpc_script, sizeof udhcpc_script,
+             "#!/system/bin/sh\n"
+             "[ \"$1\" = bound ] || [ \"$1\" = renew ] || exit 0\n"
+             "%s ifconfig $interface $ip netmask $subnet\n"
+             "[ -n \"$router\" ] && %s route add default gw $router\n",
+             bbp, bbp);
+    /* Not wr(): that is for sysfs and opens O_WRONLY without O_CREAT, so it
+     * cannot make a file that does not exist yet. */
+    int sfd = open(UDHCPC_SCRIPT, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    if (sfd >= 0) {
+        ssize_t sw = write(sfd, udhcpc_script, strlen(udhcpc_script));
+        close(sfd);
+        if (sw < 0)
+            netlog("udhcpc script write failed errno=%d\n", errno);
+    } else {
+        netlog("udhcpc script create failed errno=%d\n", errno);
+    }
+
+    char *dhcp_fos5[] = { "/system/bin/dhcpcd", "-ABK", "-f",
+                          "/system/etc/dhcpcd/dhcpcd.conf", "wlan0", NULL };
+    char *dhcp_fos6[] = { "/sbin/udhcpc", "-f", "-i", "wlan0",
+                          "-s", (char *)UDHCPC_SCRIPT, NULL };
+    char **dhcp = vendor ? dhcp_fos6 : dhcp_fos5;
     int st = 0;
 
     waitpid(spawn(loader), &st, 0);
     netlog("wmt_loader status=%d\n", st);
 
-    pid_t launcher = spawn(launch);
+    /* FireOS 6's wmt_launcher does not work here (see wmt_bringup above), so
+     * on that layout emOS configures the HIF and answers patch searches
+     * itself. FireOS 5's 6620_launcher is left alone: it works today on the
+     * fleet, and replacing a working path with an untested one is not a trade
+     * worth making until ours has run on hardware. */
+    pid_t launcher = -1;
+    if (vendor) {
+        if (wmt_bringup("/system/vendor/firmware/"))
+            netlog("wmt: bring-up failed, wlan0 will not appear\n");
+    } else {
+        launcher = spawn(launch);
+    }
     sleep(2);
 
     int r = wr("/dev/wmtWifi", "1");
@@ -1242,7 +1883,13 @@ static void net_main(void)
      * goes away, and killed (to be respawned) if it has held carrier for 20s
      * without getting an address.
      */
-    char *reassoc[] = { "/system/bin/wpa_cli", "-p/data/misc/wifi/sockets",
+    /* Ours when the image carries it, Amazon's otherwise, as for the
+     * supplicant. -p is filled in from the conf at each (re)start. */
+    static const char *const clis[] = { "/sbin/wpa_cli",
+                                        "/system/bin/wpa_cli", NULL };
+    const char *cli = first_exec(clis);
+    char pflag[160] = "-p" WPA_CTRL_DEFAULT;
+    char *reassoc[] = { (char *)(cli ? cli : clis[1]), pflag,
                         "-iwlan0", "reassociate", NULL };
     /* ntpd is pointed at the GATEWAY by IP, never at a hostname.
      *
@@ -1259,18 +1906,56 @@ static void net_main(void)
      * Client only. busybox ntpd SERVES time if given -l, and emOS holds no
      * inbound sockets at all — every daemon added here has to keep it that way.
      */
-    char *ntpd[] = { "/system/bin/busybox", "ntpd", "-n", "-p", gwip, NULL };
-    pid_t wpa = spawn(supp);
+    const char *bb_ntp = busybox_path();
+    char *ntpd[] = { (char *)(bb_ntp ? bb_ntp : "/system/bin/busybox"),
+                     "ntpd", "-n", "-p", gwip, NULL };
+    pid_t wpa = -1;
     pid_t dhc = -1, ntp = -1;
     int nudges = 0, dry = 0, netup = 0;
+    /* Loop turns spent with a conf in place but no carrier. The ring goes red
+     * after WIFI_FAIL_TURNS of them, because at that point the credentials
+     * exist and are not working, which is a fault worth showing. Waiting with
+     * NO conf is not a fault and never turns it red -- see below. */
+    int nocarrier = 0, said_fail = 0, said_noconf = 0;
 
     for (;;) {
         pid_t d;
         while ((d = waitpid(-1, &st, WNOHANG)) > 0) {
-            if (d == launcher)   launcher = spawn(launch);
-            else if (d == wpa)   wpa = spawn(supp);
+            if (launcher > 0 && d == launcher) launcher = spawn(launch);
+            else if (d == wpa)   wpa = -1;
             else if (d == dhc)   dhc = -1;
             else if (d == ntp)   ntp = netup ? spawn(ntpd) : -1;
+        }
+
+        /* No credentials yet: hold here rather than failing.
+         *
+         * This is the normal state during provisioning -- the wizard writes
+         * WiFi over the USB console AFTER emOS is already running -- so the
+         * boot waits at stage 11 until a conf appears and then carries on. A
+         * supplicant started without one just exits and respawns for ever. */
+        const char *conf = wpa_conf();
+        if (!conf) {
+            if (wpa > 0) { kill(wpa, SIGTERM); wpa = -1; }
+            if (!said_noconf) {
+                said_noconf = 1;
+                netlog("no wifi conf yet (%s or %s) - waiting\n",
+                       EMOS_WPA_CONF, ANDROID_WPA_CONF);
+            }
+            bootstep = 10; led_step();
+            sleep(5);
+            continue;
+        }
+        if (wpa < 0) {
+            snprintf(cflag, sizeof cflag, "-c%s", conf);
+            /* Re-read per start, not once: em-wifi can change which conf
+             * wpa_conf() returns while this loop is running. */
+            char ctrl[128];
+            wpa_ctrl_dir(conf, ctrl, sizeof ctrl);
+            snprintf(pflag, sizeof pflag, "-p%s", ctrl);
+            netlog("wifi conf %s ctrl %s cli %s\n", conf, ctrl, reassoc[0]);
+            wpa = spawn(supp);
+            said_noconf = 0;
+            nocarrier = 0;
         }
 
         if (readint("/sys/class/net/wlan0/carrier") != 1) {
@@ -1284,8 +1969,18 @@ static void net_main(void)
                                                   * supervision loop and may
                                                   * run many times. */
             dry = 0;
+            /* Credentials present and still no carrier: say so. A red head is
+             * the only channel left when the network is the broken thing.
+             * Once, and the loop keeps trying -- it is a clue, not a halt. */
+            if (++nocarrier >= WIFI_FAIL_TURNS && !said_fail) {
+                said_fail = 1;
+                netlog("no carrier after %ds with %s - giving up quietly\n",
+                       WIFI_FAIL_TURNS * 5, conf);
+                led_fail();
+            }
         } else {
             nudges = 0;
+            nocarrier = 0;
             if (dhc < 0) {
                 dhc = spawn(dhcp);
                 dry = 0;
@@ -1341,9 +2036,42 @@ static void svc_add(const char *name, char *const *argv, const char *req,
                     const char *after);
 static void supervise(void);
 
-int main(void)
+/* Run as anything other than PID 1, this binary is a small tool instead of an
+ * init. It is the obvious place for the reboot: it is already static, already
+ * in the ramdisk at a known path, and already owns the syscall — so a person
+ * at the console types `/init recovery` and needs nothing pushed to the device.
+ * That matters more than it sounds, because a device on emOS has no adb, so
+ * "get a binary onto it" is the problem this avoids rather than solves.
+ *
+ * THE DISCRIMINATOR IS getpid(), NOT argc. The kernel can pass arguments to
+ * init from the boot cmdline, so a device whose bootloader appended one would
+ * take the tool path and never boot — a brick produced by an argument nobody
+ * typed. PID 1 is what "am I the init" actually means.
+ */
+static int tool_main(int argc, char **argv)
+{
+    const char *mode = (argc > 1) ? argv[1] : "recovery";
+
+    if (argc > 1 && (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help"))) {
+        dprintf(1, "usage: %s [mode]    (default: recovery)\n"
+                   "reboots into the named boot mode; \"recovery\" is TWRP\n",
+                argv[0]);
+        return 0;
+    }
+
+    dprintf(1, "rebooting into \"%s\"...\n", mode);
+    reboot_into(mode);
+    dprintf(2, "the kernel refused the boot mode \"%s\": %s\n",
+            mode, strerror(errno));
+    return 1;
+}
+
+int main(int argc, char **argv)
 {
     char buf[512];
+
+    if (getpid() != 1)
+        return tool_main(argc, argv);
 
     /* mknod's mode is masked by the umask, so without this every node below
      * comes out 0644 no matter what it asks for — which is how dhcpcd's hook
@@ -1362,6 +2090,24 @@ int main(void)
     int dtr = mount("devtmpfs", "/dev", "devtmpfs", 0, NULL);
     mount("proc", "/proc", "proc", 0, NULL);
     mount("sysfs", "/sys", "sysfs", 0, NULL);
+    /* debugfs, for the eMMC's own health.
+     *
+     * The flash reports wear through PRE_EOL_INFO and two life-time estimates
+     * in the Extended CSD, and on this kernel the only way to read them is
+     * /sys/kernel/debug/mmc0/mmc0:0001/ext_csd — the generic sysfs life_time
+     * and pre_eol_info attributes are a Linux 4.9 addition and 3.18 has
+     * neither. Samsung's vendor samsung_smart attribute exists here and
+     * answers "version 0, error mode: Invalid", so it is not a route either.
+     *
+     * Without this the directory is empty and the health of the part we are
+     * writing to is unreadable on the OS doing the writing. Confirmed on Test
+     * Echo 2, 2026-09-06: mounting it by hand returned rc=0 and the dump read
+     * straight out (PRE_EOL_INFO normal, 10-20% of rated life used).
+     *
+     * mkdir first: the kernel provides the mount point on a normal Android
+     * boot and our ramdisk does not. */
+    mkdir("/sys/kernel/debug", 0755);
+    mount("debugfs", "/sys/kernel/debug", "debugfs", 0, NULL);
     mkdir("/dev/block", 0755);
 
     /* Every device node is created by hand.
@@ -1417,11 +2163,61 @@ int main(void)
     /* /system read-only: this is a diagnostic boot and nothing here should be
      * able to damage the Android install we still rely on for recovery. */
     mkdir("/system", 0755);
-    mknod("/dev/block/mmcblk0p13", S_IFBLK | 0600, makedev(179, 13));
-    int r = mount("/dev/block/mmcblk0p13", "/system", "ext4", MS_RDONLY, NULL);
-    note("stage=mount_system rc=%d errno=%d sh=%d\n", r, r ? errno : 0,
-         access("/system/bin/sh", X_OK));
-    if (r) led_fail(); else led_step();          /* 2: /system */
+    /* Which partition, from the stamp the packer put on our own cmdline --
+     * see cmdline_system_part(). Read here rather than at the top of main so
+     * the number appears in the stage line beside the mount it explains. */
+    char cmdl[2048] = "";
+    int cfd = open("/proc/cmdline", O_RDONLY);
+    if (cfd >= 0) {
+        ssize_t cn = read(cfd, cmdl, sizeof cmdl - 1);
+        close(cfd);
+        if (cn > 0)
+            cmdl[cn] = 0;
+    }
+    int sysp = cmdline_system_part(cmdl);
+    char sysdev[48];
+    snprintf(sysdev, sizeof sysdev, "/dev/block/mmcblk0p%d", sysp);
+    mknod(sysdev, S_IFBLK | 0600, makedev(179, sysp));
+    int r = mount(sysdev, "/system", "ext4", MS_RDONLY, NULL);
+
+    /* FireOS 6 is SYSTEM-AS-ROOT: the partition's root is the Android root
+     * filesystem — init, init.rc, fstab.mt8163, sbin — with the real tree in a
+     * nested `system/`, where FireOS 5 puts that tree at the partition root.
+     * So every absolute /system/... path in this file is one directory short
+     * on FireOS 6: the shell the console execs, the linker, wpa_supplicant,
+     * wmt_loader and the WiFi firmware.
+     *
+     * The mount SUCCEEDS either way, which is what made this expensive to
+     * find (measured on hardware 2026-09-12, FireOS 6.5.7.4 under amonet
+     * v2.0.0): stage 2 passed, the console execs /system/bin/sh and exits 127
+     * so the supervisor respawned it every few seconds, and the WiFi stage sat
+     * at 11 for ever with no wlan0. Nothing said /system was unusable.
+     *
+     * Bind the nested tree over the mountpoint rather than resolving a prefix
+     * per call site. A prefix cannot work here: `vendor` and `etc` inside a
+     * system-as-root partition are ABSOLUTE symlinks to /system/..., which
+     * point at themselves once the partition is mounted at /system — ELOOP,
+     * measured. Binding makes them resolve exactly as they do on a real
+     * FireOS 6 boot, and leaves every path below untouched, including the
+     * vendor-versus-system WiFi tool resolution, which is already correct and
+     * only ever needed the right root.
+     *
+     * Detected by what RUNS rather than by a build property: the shell is what
+     * the console execs and what everything below depends on. */
+    int nested = 0;
+    if (!r && access("/system/bin/sh", X_OK) != 0
+           && access("/system/system/bin/sh", X_OK) == 0) {
+        nested = mount("/system/system", "/system", NULL, MS_BIND, NULL) == 0;
+        if (!nested)
+            note("stage=mount_system bind_errno=%d\n", errno);
+    }
+    note("stage=mount_system part=%d rc=%d errno=%d nested=%d sh=%d\n",
+         sysp, r, r ? errno : 0,
+         nested, access("/system/bin/sh", X_OK));
+
+    /* A mount that landed on a tree with no shell is not a working /system,
+     * and reading it as one is precisely what let that boot look healthy. */
+    if (r || access("/system/bin/sh", X_OK) != 0) led_fail(); else led_step();  /* 2: /system */
 
     /* /data read-WRITE: the firmware keeps config, wake-word models and logs
      * there. /system stays read-only — nothing here should be able to damage
@@ -1577,11 +2373,18 @@ int main(void)
      * broken interpreter is indistinguishable from a kernel that never ran.
      */
     mkdir("/sbin", 0755);
-    char *link[] = { "/system/bin/sh", "-c",
-        "for a in $(busybox --list); do "
+    /* By absolute path, since on FireOS 6 busybox is not in /system/bin and
+     * so not on PATH yet — which is the whole reason these links exist. */
+    const char *bb_app = busybox_path();
+    if (!bb_app)
+        bb_app = "/system/bin/busybox";
+    char applets[512];
+    snprintf(applets, sizeof applets,
+        "for a in $(%s --list); do "
         "  [ -e /system/bin/$a ] || [ -e /system/xbin/$a ] || "
-        "    busybox ln -sf /system/bin/busybox /sbin/$a; "
-        "done", NULL };
+        "    %s ln -sf %s /sbin/$a; "
+        "done", bb_app, bb_app, bb_app);
+    char *link[] = { "/system/bin/sh", "-c", applets, NULL };
     int lst = 0;
     waitpid(spawn(link), &lst, 0);
     note("stage=applets status=%d vi=%d\n", lst, access("/sbin/vi", X_OK));
@@ -1657,9 +2460,11 @@ int main(void)
      * dump_log() spills the ring on the way down. Crashes survive; chatter
      * does not.
      */
-    char *syslogd[] = { "/system/bin/busybox", "syslogd", "-n",
+    const char *bb_log = busybox_path();
+    char *bbl = (char *)(bb_log ? bb_log : "/system/bin/busybox");
+    char *syslogd[] = { bbl, "syslogd", "-n",
                         "-O", "/run/messages", "-s", "256", "-b", "2", NULL };
-    char *klogd[]   = { "/system/bin/busybox", "klogd", "-n", NULL };
+    char *klogd[]   = { bbl, "klogd", "-n", NULL };
 
     /* EchoMuse itself, via its OWN supervisor rather than directly.
      *
@@ -1685,7 +2490,15 @@ int main(void)
      * controller to reach when it does start. */
     svc_add("echomuse", echomuse, "/data/local/bin/start_server.sh",
             "/run/net-up");
-    svc_add("console", NULL, NULL, NULL);   /* needs the tty as its stdio */
+    /* `req` is given even though start_console() supplies its own argv: the
+     * supervisor's absent-check reads req, falling back to argv[0], and this
+     * service has neither. Without it an unexecutable shell is respawned every
+     * few seconds for ever, which on the USB console looks like the banner
+     * cycling rather than like a failure -- and that is exactly how the FireOS
+     * 6 system-as-root layout hid for a day, with /system mounted, stage 2
+     * passed and the ring throbbing happily. Every other service would have
+     * said `svc <name> absent` once and stopped. */
+    svc_add("console", NULL, "/system/bin/sh", NULL);  /* tty is its stdio */
 
     supervise();
     return 0;
@@ -1963,6 +2776,60 @@ static int pw_load(long *iters, unsigned char *salt, int *saltlen,
  * its own output back into its input is the trap that cost an evening here
  * once already (see README).
  */
+/* Where the firmware writes the console idle timeout, in MINUTES. Beside the
+ * password record and for the same reason: the firmware writes it and init
+ * reads it, because the console has to work when EchoMuse is not running. */
+/* Overridable like LEDDIR, so the off-target check can point it at a path it
+ * is allowed to write. The CI runner is not root and /data does not exist
+ * there, which the first version of tmoutcheck.c discovered the hard way. */
+#ifndef CONSOLE_TMOUT
+#define CONSOLE_TMOUT "/data/local/etc/echomuse/console.timeout"
+#endif
+
+/* Console idle timeout in SECONDS for the shell's TMOUT, or 0 for none.
+ *
+ * Stored in minutes because that is the unit it is chosen in (0, then 1-90);
+ * multiplied here, at the one point of use, so the stored value and the
+ * number on screen never disagree by a factor of sixty.
+ *
+ * Anything unparseable, negative or over the ceiling reads as NO timeout. Same
+ * rule as the password record: refusing to behave on a corrupt string would
+ * strand the owner, and the failure has to fall toward the console still
+ * working. A too-SHORT timeout from a truncated read is the dangerous
+ * direction — it presents as the device dropping the link — so a partial
+ * number is rejected rather than used.
+ */
+static long console_timeout_secs(void)
+{
+    int fd = open(CONSOLE_TMOUT, O_RDONLY);
+    if (fd < 0)
+        return 0;
+    char b[32];
+    int n = (int)read(fd, b, sizeof b - 1);
+    close(fd);
+    if (n <= 0)
+        return 0;
+    b[n] = 0;
+
+    long v = 0;
+    int digits = 0;
+    for (int i = 0; i < n; i++) {
+        if (b[i] >= '0' && b[i] <= '9') {
+            v = v * 10 + (b[i] - '0');
+            digits++;
+            if (v > 90)          /* over the ceiling; stop before overflowing */
+                return 0;
+        } else if (b[i] == '\n' || b[i] == '\r' || b[i] == ' ' || b[i] == '\t') {
+            break;               /* trailing whitespace ends the number */
+        } else {
+            return 0;            /* anything else means the record is not a number */
+        }
+    }
+    if (!digits || v <= 0)
+        return 0;
+    return v * 60;
+}
+
 static void console_gate(void)
 {
     long iters;
@@ -2027,6 +2894,123 @@ static void console_gate(void)
         tcsetattr(0, TCSANOW, &saved);
 }
 
+/* The console banner.
+ *
+ * Somebody reaching this console is usually doing so because something is
+ * wrong, over a USB cable, with no dashboard. The four facts below are the
+ * ones they would otherwise spend their first five minutes gathering, and
+ * three of them are questions this session has actually had to ask by hand.
+ *
+ * The controller address is read from /proc/net/tcp rather than from any
+ * stored value, because there isn't one — the firmware keeps its last-known
+ * server in memory only. An ESTABLISHED connection to 8767 or 8770 IS the
+ * controller, and reading it live means the banner says who we are talking to
+ * now rather than who we once did.
+ *
+ * ASCII only and inside 80 columns: this is a vt100 over a serial gadget.
+ */
+static void tcp_peer(char *out, size_t n)
+{
+    out[0] = 0;
+    FILE *f = fopen("/proc/net/tcp", "r");
+    if (!f)
+        return;
+    char line[512];
+    if (!fgets(line, sizeof line, f)) {          /* header */
+        fclose(f);
+        return;
+    }
+    while (fgets(line, sizeof line, f)) {
+        unsigned int ra, rp, st;
+        /* sl  local_address rem_address st ... */
+        if (sscanf(line, "%*d: %*8x:%*4x %8x:%4x %2x", &ra, &rp, &st) != 3)
+            continue;
+        if (st != 0x01)                          /* ESTABLISHED */
+            continue;
+        if (rp != 8767 && rp != 8770)
+            continue;
+        snprintf(out, n, "%u.%u.%u.%u:%u",
+                 ra & 0xff, (ra >> 8) & 0xff, (ra >> 16) & 0xff,
+                 (ra >> 24) & 0xff, rp);
+        break;
+    }
+    fclose(f);
+}
+
+static void iface_addr(char *out, size_t n)
+{
+    out[0] = 0;
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0)
+        return;
+    struct ifreq r;
+    memset(&r, 0, sizeof r);
+    strncpy(r.ifr_name, "wlan0", IFNAMSIZ - 1);
+    if (ioctl(s, SIOCGIFADDR, &r) == 0) {
+        struct sockaddr_in *a = (struct sockaddr_in *)&r.ifr_addr;
+        unsigned char *b = (unsigned char *)&a->sin_addr;
+        snprintf(out, n, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+    }
+    close(s);
+}
+
+static void console_banner(void)
+{
+    char host[80], ip[32], ctl[48];
+    const char *sn = serialno();
+
+    if (gethostname(host, sizeof host) != 0 || !host[0])
+        snprintf(host, sizeof host, "emos");
+    host[sizeof host - 1] = 0;
+    iface_addr(ip, sizeof ip);
+    tcp_peer(ctl, sizeof ctl);
+
+    long up = mono_ms() / 1000;
+
+    /* The version comes from /etc/os-release, which build.sh stamps from
+     * `git describe --match 'emos-v*'`. Read rather than compiled in, so the
+     * banner cannot disagree with the file everything else reads. */
+    char ver[64] = "";
+    FILE *osr = fopen("/etc/os-release", "r");
+    if (osr) {
+        char l[160];
+        while (fgets(l, sizeof l, osr)) {
+            if (strncmp(l, "VERSION=\"", 9) == 0) {
+                char *q = strchr(l + 9, '"');
+                if (q) {
+                    *q = 0;
+                    snprintf(ver, sizeof ver, "emOS %s", l + 9);
+                }
+                break;
+            }
+        }
+        fclose(osr);
+    }
+
+    dprintf(1,
+        "\r\n"
+        "   ___  _ __ ___     ___  ___\r\n"
+        "  / _ \\| '_ ` _ \\   / _ \\/ __|   EchoMuse\r\n"
+        " |  __/| | | | | | | (_) \\__ \\   %s\r\n"
+        "  \\___||_| |_| |_|  \\___/|___/   an Echo with no Amazon on it\r\n"
+        "\r\n"
+        "   host        %s\r\n"
+        "   serial      %s\r\n"
+        "   address     %s\r\n"
+        "   controller  %s\r\n"
+        "   up          %ldm %02lds\r\n"
+        "\r\n"
+        "   logs: /run/net.log  /run/messages  /tmp/server.log\r\n"
+        "   /init recovery   reboot into TWRP  (Amazon's reboot cannot)\r\n"
+        "\r\n",
+        *ver ? ver : "emOS",
+        host,
+        *sn  ? sn  : "(unknown)",
+        *ip  ? ip  : "no address",
+        *ctl ? ctl : "not connected",
+        up / 60, up % 60);
+}
+
 static pid_t start_console(void)
 {
     int t = open(TTY, O_RDWR | O_NOCTTY);
@@ -2039,9 +3023,41 @@ static pid_t start_console(void)
         dup2(t, 0); dup2(t, 1); dup2(t, 2);
         if (t > 2) close(t);
         console_gate();
+        console_banner();
         char *argv[] = { "/system/bin/sh", NULL };
+        /* TMOUT is mksh's own idle timeout and costs no code here: an
+         * interactive shell idle at its PROMPT for that long exits, init
+         * respawns the console, and console_gate() above runs again. Timeout
+         * and password gate are the same mechanism seen twice.
+         *
+         * Idle at the prompt, not wall clock — a long foreground command is
+         * not killed under someone watching it, which matters because
+         * `logread -f` on a device being debugged is exactly the session that
+         * must not be dropped.
+         *
+         * The slot is left out of the array entirely when there is no
+         * timeout, rather than set to 0: mksh treats TMOUT=0 as no timeout
+         * too, but an absent variable cannot be misread by anything else
+         * inheriting this environment. */
+        /* Sized for the widest long, not for the 90-minute ceiling: the
+         * bound is enforced by console_timeout_secs and a buffer that
+         * depends on a check in another function is one refactor from
+         * truncating. */
+        char tmout[32];
+        /* ANDROID_DATA is set because bionic looks for tzdata under it before
+         * falling back to ANDROID_ROOT, and without it EVERY command run on
+         * this console prints two lines of
+         * `__bionic_open_tzdata_path: ANDROID_DATA not set!` before its own
+         * output. Harmless, and it made the one channel available on a broken
+         * device unreadable. */
         char *envp[] = { "HOME=/", "TERM=vt100", "ANDROID_ROOT=/system",
-                         "PATH=/sbin:/system/bin:/system/xbin", NULL };
+                         "ANDROID_DATA=/data",
+                         "PATH=/sbin:/system/bin:/system/xbin", NULL, NULL };
+        long tsec = console_timeout_secs();
+        if (tsec > 0) {
+            snprintf(tmout, sizeof tmout, "TMOUT=%ld", tsec);
+            envp[5] = tmout;
+        }
         execve("/system/bin/sh", argv, envp);
         _exit(127);
     }
